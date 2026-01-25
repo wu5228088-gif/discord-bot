@@ -38,18 +38,30 @@ async def on_ready():
 #精彩片段
 @bot.hybrid_command()
 async def line(ctx):
+    await ctx.defer()
     try:
-        resp=requests.get(lineurl)
-        resp.raise_for_status()
-        linejson=resp.json()
+        respline=requests.get(lineurl)
+        respline.raise_for_status()
+        linejson=respline.json()
         linelist=linejson.get("border_player_rankings",[])
-        
-
+        resptop100=requests.get(rankurl)
+        resptop100.raise_for_status()
+        top100json=resptop100.json()
+        top100list=top100json.get("top_100_player_rankings", [])
+       
         if not linelist:
-            await ctx.send("api網站爆了")
+            await ctx.interaction.followup.send("api網站爆了")
             return
         
         lines=[]
+        target=[10,20,30,40,50]
+
+        for tr in target:
+            match=next((item for item in top100list if item.get("rank") == tr), None)
+            if match:
+                s=match.get("score",0)
+                lines.append(f"**{tr}名**:`{s:,}`")
+
         for item in linelist:
             rank=item.get("rank","?")
             score=item.get("score",0)
@@ -66,9 +78,9 @@ async def line(ctx):
         )
         updatetime=datetime.now().strftime('%Y-%m-%d %H:%M')
         embed.set_footer(text=f"最後更新於:{updatetime}")
-        await ctx.send(embed=embed)
+        await ctx.interaction.followup.send(embed=embed)
     except Exception as e:
-        await ctx.send(f"錯誤:{e}")
+        await ctx.interaction.followup.send(f"錯誤:{e}")
 
 #特定id追蹤        
 idfile="idfile.json"
@@ -139,3 +151,4 @@ async def playerrank(ctx):
         await ctx.send(f"錯誤:{e}")
 
 bot.run(token)
+
