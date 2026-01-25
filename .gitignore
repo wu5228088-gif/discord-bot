@@ -1,0 +1,4 @@
+event_snapshots.json
+idfile.json
+__pycache__/
+.env
