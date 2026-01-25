@@ -13,8 +13,9 @@ import matplotlib.pyplot as plt
 import io
 
 import matplotlib.ticker as ticker
+import matplotlib.font_manager as fm
 
-token=os.getenv("DISCORD_TOKEN")
+token=os.getenv("DISCORD_TOKEN") or "MTQ2MzUxNjg2MjIyNTg0MjIyOA.G0JegA.v1a-MW_U7JX3XL2OaKoFdAvBFuV2PqLgZlxU34"
 
 data_dir = "/app/data" if os.getenv("ZEABUR") else "."
 idfile = os.path.join(data_dir, "idfile.json")
@@ -72,10 +73,9 @@ async def top100track():
         timestamp=datetime.now().strftime("%m/%d %H:%M")
         scoresmap={}
         for item in rankdata:
-            player_info = item.get("last_player_info", {})
-            p_profile = player_info.get("profile", {})
-            p_id = str(p_profile.get("id"))
-            p_name = p_profile.get("name", "Unknown")
+            p_name=item.get("name","Unknown")
+
+            p_id=str(item.get("last_player_info",{}).get("profile",{}).get("id"))
 
             scoresmap[p_id] = {
                 "score": item.get("score"),
@@ -178,14 +178,14 @@ async def graph(ctx):
     storage = loadsjson(top100file)
 
     times,scores=[],[]
-    last_game_name=game_id
+    last_game_name=None
     current_year = datetime.now().year
     for snap in storage.get("snapshots",[]):
         player_entry=snap["data"].get(str(game_id))
         if player_entry is not None:
             if isinstance(player_entry,dict):
                 s=player_entry.get("score")
-                last_game_name=player_entry.get("name",last_game_name)
+                last_game_name=player_entry.get("name")
             else:
                 s=player_entry
             dt=datetime.strptime(f"{current_year}/{snap['time']}", "%Y/%m/%d %H:%M")
@@ -195,6 +195,18 @@ async def graph(ctx):
     if len(scores)<2:
         await ctx.interaction.followup.send("數據不足或你被肘出100名了")
         return
+    
+    font_path="./msjh.ttc"
+    if os.path.exists(font_path):
+        fe=fm.FontEntry(fname=font_path,name='CustomFont')
+        fm.fontManager.ttflist.insert(0,fe)
+        plt.rcParams['font.family']=fe.name
+    else:
+        plt.rcParams['font.sans-serif']=['Microsoft JhengHei', 'SimHei', 'sans-serif']
+
+    plt.rcParams['axes.unicode_minus']=False
+   
+    
     
     plt.figure(figsize=(10, 6))
     plt.rcParams['axes.facecolor'] = 'white' 
@@ -216,8 +228,10 @@ async def graph(ctx):
 
     plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x,p:format(int(x),',')))
 
+    displaytitle=last_game_name if last_game_name else player_name
+
     plt.xticks(rotation=45)
-    plt.title(f"{player_name}",color='black',fontsize=14,fontweight='bold')
+    plt.title(f"{displaytitle}",color='black',fontsize=14,fontweight='bold')
     plt.tick_params(colors='black',which='both') 
 
     plt.grid(False)
@@ -244,7 +258,8 @@ async def playerrank(ctx):
         await ctx.defer()
     except Exception as e:
         print(f"Defer 失敗 (可能是重複觸發): {e}")
-    
+
+
     gameid=useridlist.get(str(ctx.author.id))
     if not gameid:
         await ctx.send("請先綁定id")
@@ -255,12 +270,14 @@ async def playerrank(ctx):
         topdata=resp.json()
         rankdata=topdata.get("top_100_player_rankings", [])
         playerinfo=None
+
         for index,item in enumerate(rankdata):
-            profile=item.get("last_player_info", {}).get("profile", {})
-            if str(profile.get("id")) == gameid:
+            p_id=item.get("last_player_info",{}).get("profile",{}).get("id")
+            if p_id==str(gameid):
                 playerinfo=item
-                playerinfo["rank_num"]=index+1
+                playerinfo["rank_num"] =index+1
                 break
+
         if playerinfo:
             name=playerinfo.get("name","未知")
             tscore=playerinfo.get("score",0)
@@ -286,5 +303,6 @@ async def playerrank(ctx):
             await ctx.interaction.followup.send("你不在100名內")
     except Exception as e:
         await ctx.interaction.followup.send(f"錯誤:{e}")
-
+        
 bot.run(token)
+
