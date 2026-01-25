@@ -15,7 +15,7 @@ import io
 import matplotlib.ticker as ticker
 import matplotlib.font_manager as fm
 
-token=os.getenv("DISCORD_TOKEN") or "MTQ2MzUxNjg2MjIyNTg0MjIyOA.G0JegA.v1a-MW_U7JX3XL2OaKoFdAvBFuV2PqLgZlxU34"
+token=os.getenv("DISCORD_TOKEN")
 
 data_dir = "/app/data" if os.getenv("ZEABUR") else "."
 idfile = os.path.join(data_dir, "idfile.json")
@@ -305,4 +305,5 @@ async def playerrank(ctx):
         await ctx.interaction.followup.send(f"錯誤:{e}")
         
 bot.run(token)
+
 
