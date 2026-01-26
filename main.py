@@ -301,20 +301,27 @@ async def playerrank(ctx):
 
     gameid=useridlist.get(str(ctx.author.id))
     if not gameid:
-        await ctx.send("請先綁定id")
+        await ctx.interaction.followup.send("請先綁定id")
         return
+    if isinstance(gameid, dict):
+        target_game_id = gameid.get("game_id")
+    else:
+        target_game_id = gameid
+
     try:
         resp=requests.get(rankurl)
         resp.raise_for_status()
         topdata=resp.json()
         rankdata=topdata.get("top_100_player_rankings", [])
         playerinfo=None
+        p_index=-1
 
         for index,item in enumerate(rankdata):
             p_id=item.get("last_player_info",{}).get("profile",{}).get("id")
-            if p_id==str(gameid):
+            if str(p_id)==str(target_game_id):
                 playerinfo=item
-                playerinfo["rank_num"] =index+1
+                playerinfo["rank_num"]=item.get("rank") or (index + 1)
+                p_index=index
                 break
 
         if playerinfo:
@@ -322,25 +329,43 @@ async def playerrank(ctx):
             tscore=playerinfo.get("score",0)
             rank = playerinfo["rank_num"]
             stat1h=playerinfo.get("last_1h_stats", {})
+            hscore=stat1h.get("score",0)
             count=stat1h.get("count",0)
-            score=stat1h.get("score",0)
-            speed=stat1h.get("speed",0)
-            lastscore=stat1h.get("lastscore",0)
+            lastscore=playerinfo.get("last_score",0)
             avg=stat1h.get("average",0)
+
+            diff_text = ""
+            
+            if p_index > 0:
+                prev_player = rankdata[p_index - 1]
+                prev_score = prev_player.get("score", 0)
+                diff_up = prev_score - tscore
+                diff_text += f"與前一名 ({prev_player.get('rank')}名) 差距: `-{diff_up:,}`\n"
+            
+            if p_index < len(rankdata) - 1:
+                next_player = rankdata[p_index + 1]
+                next_score = next_player.get("score", 0)
+                diff_down = tscore - next_score
+                diff_text += f"與後一名 ({next_player.get('rank')}名) 差距: `+{diff_down:,}`"
 
             embed=discord.Embed(
                 title=f"{name}",
                 color=0x00ff00
             )
-            embed.description=f"排名:{rank}\n總分:{tscore:,}"
-            embed.add_field(name="時速",value=f"{score:,}",inline=False)
+            embed.description=f"排名:{rank}\n總分:{tscore:,}\n\n{diff_text}"
+            embed.add_field(name="時速",value=f"{hscore:,}",inline=False)
             embed.add_field(name="周回",value=f"{count}",inline=False)
             embed.add_field(name="場均",value=f"{avg}",inline=False)
+            embed.add_field(name="最近一把pt",value=f"{lastscore}",inline=False)
+            updatetime = datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')
+            embed.set_footer(text=f"最後更新於: {updatetime}")
 
             await ctx.interaction.followup.send(embed=embed)
         else:
             await ctx.interaction.followup.send("你不在100名內")
     except Exception as e:
         await ctx.interaction.followup.send(f"錯誤:{e}")
+
 bot.run(token)
+
 
