@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands,tasks
 
 import datetime
-from datetime import datetime
+from datetime import datetime,timedelta,timezone
 
 import requests
 
@@ -15,7 +15,8 @@ import io
 import matplotlib.ticker as ticker
 import matplotlib.font_manager as fm
 
-token=os.getenv("DISCORD_TOKEN")
+token=os.getenv("DISCORD_TOKEN") 
+TW=timezone(timedelta(hours=8))
 
 data_dir = "/app/data" if os.getenv("ZEABUR") else "."
 idfile = os.path.join(data_dir, "idfile.json")
@@ -44,6 +45,24 @@ def savesjson(path,data):
     with open(path,"w",encoding="utf-8") as f:
         json.dump(data,f,indent=4,ensure_ascii=False)
 
+def get_event_start_time():
+    try:
+        resp = requests.get(rankurl, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        start_str = data.get("start_at")
+        if not start_str:
+            return None
+
+        # 解析 UTC → 轉台灣時間
+        dt_utc = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        return dt_utc.astimezone(TW)
+
+    except Exception as e:
+        print("活動開始時間取得失敗:", e)
+        return None
+
 #全域同步
 @bot.event
 async def on_ready():
@@ -70,7 +89,7 @@ async def top100track():
         if not storage or storage.get("last_id") !=currentid:
             storage={"last_id":currentid,"snapshots": []}
         
-        timestamp=datetime.now().strftime("%m/%d %H:%M")
+        timestamp=datetime.now(TW).strftime("%m/%d %H:%M")
         scoresmap={}
         for item in rankdata:
             p_name=item.get("name","Unknown")
@@ -140,7 +159,7 @@ async def line(ctx):
             description=ranktext,
             color=0x1ABC9C
         )
-        updatetime=datetime.now().strftime('%Y-%m-%d %H:%M')
+        updatetime=datetime.now(TW).strftime('%Y-%m-%d %H:%M')
         embed.set_footer(text=f"最後更新於:{updatetime}")
         await ctx.interaction.followup.send(embed=embed)
     except Exception as e:
@@ -179,22 +198,34 @@ async def graph(ctx):
 
     times,scores=[],[]
     last_game_name=None
-    current_year = datetime.now().year
+    nowtw=datetime.now(TW)
+    current_year=nowtw.year
     for snap in storage.get("snapshots",[]):
         player_entry=snap["data"].get(str(game_id))
+
         if player_entry is not None:
             if isinstance(player_entry,dict):
                 s=player_entry.get("score")
                 last_game_name=player_entry.get("name")
             else:
                 s=player_entry
-            dt=datetime.strptime(f"{current_year}/{snap['time']}", "%Y/%m/%d %H:%M")
-            times.append(dt)
-            scores.append(s)
+            
+            try:
+                dt_str=(f"{current_year}/{snap['time']}")
+                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")
+                dt=dt.replace(tzinfo=TW)
+                times.append(dt)
+                scores.append(s)
+            except Exception as e:
+                print(f"解析失敗的時間字串是: {snap['time']}, 錯誤: {e}")
 
     if len(scores)<2:
         await ctx.interaction.followup.send("數據不足或你被肘出100名了")
         return
+    
+    combined=sorted(zip(times, scores))
+    times,scores=zip(*combined)
+    times,scores=list(times), list(scores)
     
     font_path="./msjh.ttc"
     if os.path.exists(font_path):
@@ -220,11 +251,19 @@ async def graph(ctx):
     import matplotlib.dates as mdates
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
 
-    start_time=times[0]
-    now_time=datetime.now()
-    plt.xlim(start_time,now_time)
+    event_start=get_event_start_time()
+    now_time=datetime.now(TW)
 
-    plt.ylim(0,current_score*1.1)
+    last_data_time = max(times)
+    current_now = datetime.now(TW)
+    end_view = max(last_data_time, current_now)
+
+    if event_start:
+        plt.xlim(event_start, now_time)
+    else:
+        plt.xlim(min(times), now_time)
+
+    plt.ylim(0,max(current_score*1.1,100))
 
     plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x,p:format(int(x),',')))
 
@@ -303,7 +342,7 @@ async def playerrank(ctx):
             await ctx.interaction.followup.send("你不在100名內")
     except Exception as e:
         await ctx.interaction.followup.send(f"錯誤:{e}")
-        
+
 bot.run(token)
 
 
