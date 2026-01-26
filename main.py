@@ -15,7 +15,8 @@ import io
 import matplotlib.ticker as ticker
 import matplotlib.font_manager as fm
 
-token=os.getenv("DISCORD_TOKEN") 
+token=os.getenv("DISCORD_TOKEN")
+
 TW=timezone(timedelta(hours=8))
 
 data_dir = "/app/data" if os.getenv("ZEABUR") else "."
@@ -227,13 +228,13 @@ async def graph(ctx):
     times,scores=zip(*combined)
     times,scores=list(times), list(scores)
     
-    font_path="./msjh.ttc"
+    font_path="./NotoSansTC-Bold.ttf"
     if os.path.exists(font_path):
-        fe=fm.FontEntry(fname=font_path,name='CustomFont')
+        fe=fm.FontEntry(fname=font_path,name='NotoSansTC-Bold')
         fm.fontManager.ttflist.insert(0,fe)
-        plt.rcParams['font.family']=fe.name
+        plt.rcParams['font.family']=[fe.name]
     else:
-        plt.rcParams['font.sans-serif']=['Microsoft JhengHei', 'SimHei', 'sans-serif']
+        plt.rcParams['font.sans-serif']=['Microsoft JhengHei','Noto Sans TC','sans-serif']
 
     plt.rcParams['axes.unicode_minus']=False
    
@@ -253,10 +254,7 @@ async def graph(ctx):
 
     event_start=get_event_start_time()
     now_time=datetime.now(TW)
-
-    last_data_time = max(times)
-    current_now = datetime.now(TW)
-    end_view = max(last_data_time, current_now)
+ 
 
     if event_start:
         plt.xlim(event_start, now_time)
@@ -269,8 +267,10 @@ async def graph(ctx):
 
     displaytitle=last_game_name if last_game_name else player_name
 
-    plt.xticks(rotation=45)
-    plt.title(f"{displaytitle}",color='black',fontsize=14,fontweight='bold')
+
+    plt.xticks(rotation=45,fontsize=10,weight=1000)
+    plt.yticks(fontsize=10,weight=1000)
+    plt.title(f"{displaytitle}",color='black',fontsize=20,weight=1000,pad=15)
     plt.tick_params(colors='black',which='both') 
 
     plt.grid(False)
@@ -342,7 +342,5 @@ async def playerrank(ctx):
             await ctx.interaction.followup.send("你不在100名內")
     except Exception as e:
         await ctx.interaction.followup.send(f"錯誤:{e}")
-
 bot.run(token)
-
 
