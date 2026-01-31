@@ -15,7 +15,9 @@ import io
 import matplotlib.ticker as ticker
 import matplotlib.font_manager as fm
 
-token=os.getenv("DISCORD_TOKEN")
+
+
+token=os.getenv("DISCORD_TOKEN") or "MTQ2MzUxNjg2MjIyNTg0MjIyOA.G0JegA.v1a-MW_U7JX3XL2OaKoFdAvBFuV2PqLgZlxU34"
 
 TW=timezone(timedelta(hours=8))
 
@@ -43,7 +45,7 @@ def savesjson(path,data):
 
 def get_event_start_time():
     try:
-        resp = requests.get(rankurl, timeout=10)
+        resp = requests.get(rankurl,timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
@@ -51,9 +53,8 @@ def get_event_start_time():
         if not start_str:
             return None
 
-        # 解析 UTC → 轉台灣時間
         dt_utc = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
-        return dt_utc.astimezone(TW)
+        return dt_utc.astimezone(TW).replace(tzinfo=None)
 
     except Exception as e:
         print("活動開始時間取得失敗:", e)
@@ -212,8 +213,7 @@ async def graph(ctx):
             
             try:
                 dt_str=(f"{current_year}/{snap['time']}")
-                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")+timedelta(hours=8)
-                dt=dt.replace(tzinfo=TW)
+                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")
                 times.append(dt)
                 scores.append(s)
             except Exception as e:
@@ -252,7 +252,7 @@ async def graph(ctx):
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
 
     event_start=get_event_start_time()
-    now_time=datetime.now(TW)
+    now_time=datetime.now(TW).replace(tzinfo=None)  
  
 
     if event_start:
@@ -454,12 +454,11 @@ async def trackgraph(ctx,input:int):
 
         if player_entry is not None:
             s = player_entry.get("score")
-            last_game_name = player_entry.get("name") # 記錄最後一個點的名字作為標題
+            last_game_name = player_entry.get("name")
             
             try:
                 dt_str=(f"{current_year}/{snap['time']}")
-                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")+timedelta(hours=8)
-                dt=dt.replace(tzinfo=TW)
+                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")
                 times.append(dt)
                 scores.append(s)
             except Exception as e:
@@ -497,7 +496,7 @@ async def trackgraph(ctx,input:int):
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
 
     event_start=get_event_start_time()
-    now_time=datetime.now(TW)
+    now_time=datetime.now(TW).replace(tzinfo=None)
  
 
     if event_start:
@@ -530,8 +529,21 @@ async def trackgraph(ctx,input:int):
     plt.close()
 
     await ctx.interaction.followup.send(file=discord.File(buf, "trend.png"))
-    
+
+bot.remove_command('help')
+#幫助
+@bot.hybrid_command()
+async def help(ctx):
+    await ctx.defer()
+    await ctx.interaction.followup.send(f"""第一次使用時先用/bind指令綁定你的遊戲id
+/line可查詢榜線
+/graph可針對綁定的id繪製分數曲線圖
+/playerrank可針對綁定的id回傳玩家訊息
+/trackrank可針對指定玩家(1~100名)回傳玩家訊息
+/trackgraph可針對指定排名(1~100名)繪製分數曲線圖""")
+
 bot.run(token)
+
 
 
 
