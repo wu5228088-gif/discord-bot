@@ -212,7 +212,7 @@ async def graph(ctx):
             
             try:
                 dt_str=(f"{current_year}/{snap['time']}")
-                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")
+                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")+timedelta(hours=8)
                 dt=dt.replace(tzinfo=TW)
                 times.append(dt)
                 scores.append(s)
@@ -458,7 +458,7 @@ async def trackgraph(ctx,input:int):
             
             try:
                 dt_str=(f"{current_year}/{snap['time']}")
-                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")
+                dt=datetime.strptime(dt_str,"%Y/%m/%d %H:%M")+timedelta(hours=8)
                 dt=dt.replace(tzinfo=TW)
                 times.append(dt)
                 scores.append(s)
@@ -532,5 +532,6 @@ async def trackgraph(ctx,input:int):
     await ctx.interaction.followup.send(file=discord.File(buf, "trend.png"))
     
 bot.run(token)
+
 
 
