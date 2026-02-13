@@ -17,7 +17,7 @@ import matplotlib.font_manager as fm
 
 
 
-token=os.getenv("DISCORD_TOKEN") or "MTQ2MzUxNjg2MjIyNTg0MjIyOA.G0JegA.v1a-MW_U7JX3XL2OaKoFdAvBFuV2PqLgZlxU34"
+token=os.getenv("DISCORD_TOKEN")
 
 TW=timezone(timedelta(hours=8))
 
@@ -207,6 +207,7 @@ async def graph(ctx):
         if player_entry is not None:
             if isinstance(player_entry,dict):
                 s=player_entry.get("score")
+                r=player_entry.get("rank")
                 last_game_name=player_entry.get("name")
             else:
                 s=player_entry
@@ -264,7 +265,7 @@ async def graph(ctx):
 
     plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x,p:format(int(x),',')))
 
-    displaytitle=last_game_name if last_game_name else player_name
+    displaytitle=f"{r}名-{last_game_name}"
 
 
     plt.xticks(rotation=45,fontsize=10,weight=1000)
@@ -361,7 +362,7 @@ async def playerrank(ctx):
 
             await ctx.interaction.followup.send(embed=embed)
         else:
-            await ctx.interaction.followup.send("你不在100名內")
+            await ctx.interaction.followup.send("你被肘出100名了")
     except Exception as e:
         await ctx.interaction.followup.send(f"錯誤:{e}")
 
@@ -543,6 +544,7 @@ async def help(ctx):
 /trackgraph可針對指定排名(1~100名)繪製分數曲線圖""")
 
 bot.run(token)
+
 
 
 
