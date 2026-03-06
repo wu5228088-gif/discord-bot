@@ -30,8 +30,8 @@ intents.message_content=True
 bot=commands.Bot(command_prefix="!", intents=intents)
 
 
-lineurl="https://api.hisekai.org/event/live/border"
-rankurl="https://api.hisekai.org/event/live/top100"
+lineurl="https://api.hisekai.org/tw/event/live/border"
+rankurl="https://api.hisekai.org/tw/event/live/top100"
 
 def loadsjson(path):
     if os.path.exists(path):
@@ -544,6 +544,7 @@ async def help(ctx):
 /trackgraph可針對指定排名(1~100名)繪製分數曲線圖""")
 
 bot.run(token)
+
 
 
 
