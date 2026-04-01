@@ -509,7 +509,7 @@ async def trackgraph(ctx,input:int):
 
     plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x,p:format(int(x),',')))
 
-    displaytitle=f"{input}名-{last_game_name}" if last_game_name else f"{input}名"
+    displaytitle=f"第{input}名" if last_game_name else f"{input}名"
 
 
     plt.xticks(rotation=45,fontsize=10,weight=1000)
@@ -531,6 +531,120 @@ async def trackgraph(ctx,input:int):
 
     await ctx.interaction.followup.send(file=discord.File(buf, "trend.png"))
 
+@bot.hybrid_command()
+async def rankgraph(ctx, rank_input: int):
+    try:
+        await ctx.defer()
+    except Exception as e:
+        print(f"Defer 失敗: {e}")
+
+    if not (1 <= rank_input <= 100):
+        await ctx.interaction.followup.send("請輸入 1~100 之間的整數")
+        return
+
+    storage = loadsjson(top100file)
+    snapshots = storage.get("snapshots", [])
+    if not snapshots:
+        await ctx.interaction.followup.send("目前沒有數據庫資料")
+        return
+
+    # --- 第一階段：找出「最新一次」該名次的玩家 ID ---
+    latest_snap = snapshots[-1]
+    target_game_id = None
+    target_name = "未知玩家"
+    current_rank = None
+
+    for uid, pdata in latest_snap.get("data", {}).items():
+        if isinstance(pdata, dict):
+            r = pdata.get("rank")
+            if r is not None and int(r) == int(rank_input):
+                target_game_id = uid
+                target_name = pdata.get("name", "未知玩家")
+                current_rank = r
+                break
+    
+    if not target_game_id:
+        await ctx.interaction.followup.send(f"目前前 100 名中找不到第 {rank_input} 名的玩家")
+        return
+
+    # --- 第二階段：追蹤該 ID 的所有歷史分數 ---
+    times, scores = [], []
+    nowtw = datetime.now(TW)
+    current_year = nowtw.year
+
+    for snap in snapshots:
+        player_entry = snap["data"].get(str(target_game_id))
+        if player_entry is not None:
+            if isinstance(player_entry, dict):
+                s = player_entry.get("score")
+            else:
+                s = player_entry
+            
+            try:
+                dt_str = f"{current_year}/{snap['time']}"
+                dt = datetime.strptime(dt_str, "%Y/%m/%d %H:%M")
+                times.append(dt)
+                scores.append(s)
+            except Exception as e:
+                print(f"解析失敗的時間字串是: {snap['time']}, 錯誤: {e}")
+
+    if len(scores) < 2:
+        await ctx.interaction.followup.send(f"玩家 {target_name} 的數據不足，無法繪圖")
+        return
+
+    # --- 第三階段：繪圖 ---
+    combined = sorted(zip(times, scores))
+    times, scores = zip(*combined)
+    times, scores = list(times), list(scores)
+
+    font_path = "./NotoSansTC-Bold.ttf"
+    if os.path.exists(font_path):
+        fe = fm.FontEntry(fname=font_path, name='NotoSansTC-Bold')
+        fm.fontManager.ttflist.insert(0, fe)
+        plt.rcParams['font.family'] = [fe.name]
+    else:
+        plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'Noto Sans TC', 'sans-serif']
+
+    plt.rcParams['axes.unicode_minus'] = False
+    plt.figure(figsize=(10, 6))
+    plt.rcParams['axes.facecolor'] = 'white'
+    plt.plot(times, scores, color='#1ABC9C', linewidth=3, markersize=4)
+
+    current_score = scores[-1]
+    if current_score > 0:
+        tick_spacing = current_score * 0.125
+        plt.gca().yaxis.set_major_locator(ticker.MultipleLocator(tick_spacing))
+
+    import matplotlib.dates as mdates
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%m/%d %H:%M'))
+    
+    event_start = get_event_start_time()
+    now_time = datetime.now(TW).replace(tzinfo=None)
+    if event_start:
+        plt.xlim(event_start, now_time)
+    else:
+        plt.xlim(min(times), now_time)
+
+    plt.ylim(0, max(current_score * 1.1, 100))
+    plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(lambda x, p: format(int(x), ',')))
+
+    plt.xticks(rotation=45, fontsize=10, weight=1000)
+    plt.yticks(fontsize=10, weight=1000)
+    plt.title(f"{rank_input}名玩家-{target_name}的走勢圖", color='black', fontsize=20, weight=1000, pad=15)
+    
+    for spine in plt.gca().spines.values():
+        spine.set_color('black')
+
+    plt.tight_layout()
+    plt.grid(False)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', facecolor='white', edgecolor='none')
+    buf.seek(0)
+    plt.close()
+
+    await ctx.interaction.followup.send(file=discord.File(buf, "rank_trend.png"))
+
 bot.remove_command('help')
 #幫助
 @bot.hybrid_command()
@@ -541,7 +655,8 @@ async def help(ctx):
 /graph可針對綁定的id繪製分數曲線圖
 /playerrank可針對綁定的id回傳玩家訊息
 /trackrank可針對指定玩家(1~100名)回傳玩家訊息
-/trackgraph可針對指定排名(1~100名)繪製分數曲線圖""")
+/trackgraph可針對指定排名(1~100名)繪製分數曲線圖
+/rankgraph可針對指定排名繪製該玩家的分數曲線圖""")
 
 bot.run(token)
 
