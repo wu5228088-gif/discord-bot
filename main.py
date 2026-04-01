@@ -630,7 +630,7 @@ async def rankgraph(ctx, rank_input: int):
 
     plt.xticks(rotation=45, fontsize=10, weight=1000)
     plt.yticks(fontsize=10, weight=1000)
-    plt.title(f"{rank_input}名玩家-{target_name}的走勢圖", color='black', fontsize=20, weight=1000, pad=15)
+    plt.title(f"{rank_input}名-{target_name}", color='black', fontsize=20, weight=1000, pad=15)
     
     for spine in plt.gca().spines.values():
         spine.set_color('black')
