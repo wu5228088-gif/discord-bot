@@ -15,6 +15,21 @@ import io
 import matplotlib.ticker as ticker
 import matplotlib.font_manager as fm
 
+from flask import Flask          # 新增這行
+from threading import Thread    # 新增這行
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
 
 token=os.getenv("DISCORD_TOKEN")
@@ -666,6 +681,9 @@ async def help(ctx):
 /trackrank可針對指定排名(1~100名，最多可指定3個)，並回傳玩家訊息
 /trackgraph可針對指定排名(1~100名)繪製分數曲線圖
 /rankgraph可針對指定排名繪製該玩家的分數曲線圖""")
+
+if __name__ == "__main__":
+    keep_alive()
 
 bot.run(token)
 
