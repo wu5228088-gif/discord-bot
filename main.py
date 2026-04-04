@@ -368,65 +368,74 @@ async def playerrank(ctx):
 
 #特定排名追蹤
 @bot.hybrid_command()
-async def trackrank(ctx,input:int):
+async def trackrank(ctx, rank1: int, rank2: int = None, rank3: int = None):
     try:
         await ctx.defer()
     except Exception as e:
         print(f"Defer 失敗: {e}")
 
-    if not(1<=input<=100):
-        await ctx.interaction.followup.send("請輸入1~100之間的整數")
-        return
+    requested_ranks = [r for r in [rank1, rank2, rank3] if r is not None]
+
+    for r in requested_ranks:
+        if not (1 <= r <= 100):
+            await ctx.interaction.followup.send(f"請輸入1~100之間的整數 (錯誤輸入: {r})")
+            return
+
     try:
-        resp=requests.get(rankurl)
+        resp = requests.get(rankurl)
         resp.raise_for_status()
-        topdata=resp.json()
+        topdata = resp.json()
+        rankdata = topdata.get("rankings") or topdata.get("top_100_player_rankings", [])
 
-        rankdata=topdata.get("rankings") or topdata.get("top_100_player_rankings", [])
-        p_index=input-1
-
-        if p_index<len(rankdata):
-            playerinfo=rankdata[p_index]
+        embed = discord.Embed(
+            color=0x00ff00
+        )
         
-            name=playerinfo.get("name","未知")
-            tscore=playerinfo.get("score",0)
-            stat1h=playerinfo.get("last_1h_stats", {})
-            hscore=stat1h.get("score",0)
-            count=stat1h.get("count",0)
-            lastscore=playerinfo.get("last_score",0)
-            avg=stat1h.get("average",0)
+        all_descriptions = []
+        updatetime = datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')
 
-            diff_text = ""
-            
-            if p_index > 0:
-                prev_player = rankdata[p_index - 1]
-                prev_score = prev_player.get("score", 0)
-                diff_up = prev_score - tscore
-                diff_text += f"與前一名 ({prev_player.get('rank')}名) 差距: `-{diff_up:,}`\n"
-            
-            if p_index < len(rankdata) - 1:
-                next_player = rankdata[p_index + 1]
-                next_score = next_player.get("score", 0)
-                diff_down = tscore - next_score
-                diff_text += f"與後一名 ({next_player.get('rank')}名) 差距: `+{diff_down:,}`"
+        for r_input in requested_ranks:
+            p_index = r_input - 1
+            if p_index < len(rankdata):
+                playerinfo = rankdata[p_index]
+                name = playerinfo.get("name", "未知")
+                tscore = playerinfo.get("score", 0)
+                stat1h = playerinfo.get("last_1h_stats", {})
+                hscore = stat1h.get("score", 0)
+                count = stat1h.get("count", 0)
+                avg = stat1h.get("average", 0)
 
-            embed=discord.Embed(
-                    title=f"{input}名-{name}",
-                    color=0x00ff00
+                diff_text = ""
+                if p_index > 0:
+                    prev_rank = r_input - 1
+                    prev_score = rankdata[p_index - 1].get("score", 0)
+                    diff_text += f"與前一名 ({prev_rank}名) 差距: `-{prev_score - tscore:,}`\n"
+                
+                if p_index < len(rankdata) - 1:
+                    next_rank = r_input + 1
+                    next_score = rankdata[p_index + 1].get("score", 0)
+                    diff_text += f"與後一名 ({next_rank}名) 差距: `+{tscore - next_score:,}`"
+
+                player_content = (
+                    f"**{r_input} 名 - {name}**\n"
+                    f"總分: `{tscore:,}`\n"
+                    f"{diff_text}\n"
+                    f"時速: `{hscore:,}`\n"
+                    f"周回: `{count}`\n"
+                    f"場均: `{avg}`"
                 )
-            embed.description=f"排名:{input}\n總分:{tscore:,}\n\n{diff_text}"
-            embed.add_field(name="時速",value=f"{hscore:,}",inline=False)
-            embed.add_field(name="周回",value=f"{count}",inline=False)
-            embed.add_field(name="場均",value=f"{avg}",inline=False)
-            embed.add_field(name="最近一把pt",value=f"{lastscore}",inline=False)
-            updatetime=datetime.now(TW).strftime('%Y-%m-%d %H:%M:%S')
+                all_descriptions.append(player_content)
+
+        if all_descriptions:
+            embed.description = "\n\n-------------------------------------\n\n".join(all_descriptions)
             embed.set_footer(text=f"最後更新於: {updatetime}")
             await ctx.interaction.followup.send(embed=embed)
         else:
-            await ctx.interaction.followup.send("錯誤")
+            await ctx.interaction.followup.send("找不到指定的排名數據")
+
     except Exception as e:
         await ctx.interaction.followup.send(f"錯誤:{e}")
-
+        
 #特定排名繪圖
 @bot.hybrid_command()
 async def trackgraph(ctx,input:int):
@@ -532,7 +541,7 @@ async def trackgraph(ctx,input:int):
     await ctx.interaction.followup.send(file=discord.File(buf, "trend.png"))
 
 @bot.hybrid_command()
-async def rankgraph(ctx, rank_input: int):
+async def rankgraph(ctx, input: int):
     try:
         await ctx.defer()
     except Exception as e:
@@ -654,7 +663,7 @@ async def help(ctx):
 /line可查詢榜線
 /graph可針對綁定的id繪製分數曲線圖
 /playerrank可針對綁定的id回傳玩家訊息
-/trackrank可針對指定玩家(1~100名)回傳玩家訊息
+/trackrank可針對指定排名(1~100名，最多可指定3個)，並回傳玩家訊息
 /trackgraph可針對指定排名(1~100名)繪製分數曲線圖
 /rankgraph可針對指定排名繪製該玩家的分數曲線圖""")
 
