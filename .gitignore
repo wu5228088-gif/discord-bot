@@ -1,4 +1,31 @@
-event_snapshots.json
-idfile.json
-__pycache__/
+# Secrets
 .env
+
+# Local/generated bot data
+idfile.json
+event_data.json
+*.json.tmp
+
+# Old broken source kept only as a local reference
+import os.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Local release packages
+*.zip
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
