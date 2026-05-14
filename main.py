@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import io
 import json
 import logging
 import os
 import re
+import zipfile
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import discord
@@ -23,10 +28,21 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+from tools.analyze_pjsk_snapshot import (
+    build_mysekai_report,
+    build_profile_report,
+    draw_music_status_query,
+    draw_music_status_query_pages,
+)
+from tools.snapshot_pipeline import SnapshotPipelineError, prepare_snapshot_input
+
 
 BASE_DIR = Path(__file__).resolve().parent
-ID_FILE = BASE_DIR / "idfile.json"
-DATA_FILE = BASE_DIR / "event_data.json"
+DATA_DIR = Path(os.getenv("BOT_DATA_DIR") or os.getenv("RENDER_DISK_PATH") or BASE_DIR)
+ID_FILE = DATA_DIR / "idfile.json"
+DATA_FILE = DATA_DIR / "event_data.json"
+UPLOAD_REPORT_DIR = DATA_DIR / "reports" / "uploads"
+ANALYSIS_STATE_FILE = DATA_DIR / "analysis_state.json"
 
 TW = timezone(timedelta(hours=8))
 REQUEST_TIMEOUT = 15
@@ -49,6 +65,25 @@ BORDER_URL = os.getenv(
 MODE_CHOICES = [
     app_commands.Choice(name="總榜", value="total"),
     app_commands.Choice(name="章節榜", value="chapter"),
+]
+
+DIFFICULTY_CHOICES = [
+    app_commands.Choice(name="全部", value="all"),
+    app_commands.Choice(name="Easy", value="easy"),
+    app_commands.Choice(name="Normal", value="normal"),
+    app_commands.Choice(name="Hard", value="hard"),
+    app_commands.Choice(name="Expert", value="expert"),
+    app_commands.Choice(name="Master", value="master"),
+    app_commands.Choice(name="Append", value="append"),
+]
+
+MUSIC_STATUS_CHOICES = [
+    app_commands.Choice(name="全部", value="all"),
+    app_commands.Choice(name="Clear", value="clear"),
+    app_commands.Choice(name="Full Combo", value="full_combo"),
+    app_commands.Choice(name="All Perfect", value="all_perfect"),
+    app_commands.Choice(name="未通關", value="not_clear"),
+    app_commands.Choice(name="未記錄", value="not_played"),
 ]
 
 CHARACTER_MAP = {
@@ -94,15 +129,26 @@ def load_env_file(path: Path = BASE_DIR / ".env") -> None:
     if not path.exists():
         return
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
 
         key, value = line.split("=", 1)
-        key = key.strip()
+        key = key.strip().lstrip("\ufeff")
         value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        if key and not os.environ.get(key):
+            os.environ[key] = value
+
+
+def configure_data_paths() -> None:
+    global DATA_DIR, ID_FILE, DATA_FILE, UPLOAD_REPORT_DIR, ANALYSIS_STATE_FILE
+
+    DATA_DIR = Path(os.getenv("BOT_DATA_DIR") or os.getenv("RENDER_DISK_PATH") or BASE_DIR)
+    ID_FILE = DATA_DIR / "idfile.json"
+    DATA_FILE = DATA_DIR / "event_data.json"
+    UPLOAD_REPORT_DIR = DATA_DIR / "reports" / "uploads"
+    ANALYSIS_STATE_FILE = DATA_DIR / "analysis_state.json"
 
 
 def setup_matplotlib_font() -> None:
@@ -162,12 +208,130 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     tmp_path.replace(path)
+
+
+def safe_upload_name(name: str) -> str:
+    stem = Path(name).stem
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return safe or "snapshot"
+
+
+def safe_upload_basename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    return safe or "snapshot"
+
+
+async def save_snapshot_attachment(
+    attachment: discord.Attachment,
+    output_dir: Path,
+) -> Path:
+    suffix = Path(attachment.filename).suffix.lower()
+    if attachment.size and attachment.size > 50 * 1024 * 1024:
+        raise ValueError("檔案太大，請上傳 50MB 以內的檔案；更大的 response/包體建議改走網頁或本地處理。")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if suffix == ".json":
+        input_path = output_dir / f"{safe_upload_name(attachment.filename)}.json"
+    else:
+        input_path = output_dir / f"{safe_upload_basename(attachment.filename)}.bin"
+    await attachment.save(input_path)
+    return input_path
+
+
+def zip_report_dir(output_dir: Path, zip_name: str) -> Path:
+    zip_path = output_dir.with_name(zip_name)
+    if zip_path.exists():
+        zip_path.unlink()
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(output_dir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(output_dir))
+    return zip_path
+
+
+def upload_output_dir(ctx: commands.Context, kind: str) -> Path:
+    stamp = datetime.now(TW).strftime("%Y%m%d_%H%M%S")
+    return UPLOAD_REPORT_DIR / f"{ctx.author.id}_{stamp}_{kind}"
+
+
+def load_analysis_state() -> Dict[str, Any]:
+    data = load_json(ANALYSIS_STATE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_analysis_state(state: Dict[str, Any]) -> None:
+    save_json(ANALYSIS_STATE_FILE, state)
+
+
+def remember_analysis(user_id: int, kind: str, output_dir: Path, zip_path: Path) -> None:
+    state = load_analysis_state()
+    user_state = state.setdefault(str(user_id), {})
+    user_state[kind] = {
+        "outputDir": str(output_dir),
+        "zipPath": str(zip_path),
+        "updatedAt": datetime.now(TW).isoformat(timespec="seconds"),
+    }
+    save_analysis_state(state)
+
+
+def last_analysis_dir(user_id: int, kind: str) -> Path | None:
+    state = load_analysis_state()
+    user_state = state.get(str(user_id))
+    if not isinstance(user_state, dict):
+        return None
+    item = user_state.get(kind)
+    if not isinstance(item, dict):
+        return None
+    raw_path = item.get("outputDir")
+    if not isinstance(raw_path, str):
+        return None
+    path = Path(raw_path)
+    return path if path.exists() else None
+
+
+def read_csv_rows(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as fp:
+        return [dict(row) for row in csv.DictReader(fp)]
+
+
+def clamp_count(value: int, *, default: int = 20, minimum: int = 1, maximum: int = 25) -> int:
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = default
+    return max(minimum, min(maximum, count))
+
+
+def sendable_lines(lines: Iterable[str], limit: int = 3600) -> str:
+    selected: List[str] = []
+    used = 0
+    for line in lines:
+        line = str(line)
+        if used + len(line) + 1 > limit:
+            selected.append("...")
+            break
+        selected.append(line)
+        used += len(line) + 1
+    return "\n".join(selected)
+
+
+async def send_query_embed(ctx: commands.Context, title: str, lines: Iterable[str], empty: str) -> None:
+    body = sendable_lines(lines)
+    if not body:
+        await ctx.send(empty)
+        return
+    embed = discord.Embed(title=title, description=body, color=EMBED_COLOR)
+    await ctx.send(embed=embed)
 
 
 def fetch_json(url: str) -> Dict[str, Any]:
@@ -798,6 +962,7 @@ def load_event_storage(top_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 load_env_file()
+configure_data_paths()
 TOP100_URL = os.getenv("HISEKAI_TOP100_URL", TOP100_URL)
 BORDER_URL = os.getenv("HISEKAI_BORDER_URL", BORDER_URL)
 
@@ -1010,6 +1175,392 @@ async def line(ctx: commands.Context, mode: str = "total") -> None:
     await ctx.send(embed=embed)
 
 
+@bot.hybrid_command(name="analyzemysekai", description="分析上傳的 MySekai JSON")
+@app_commands.describe(file="原始 response、sssekai_mysekai.json 或 sssekai_mysekai_readable.json")
+async def analyze_mysekai_command(ctx: commands.Context, file: discord.Attachment) -> None:
+    await ctx.defer()
+    output_dir = upload_output_dir(ctx, "mysekai")
+
+    try:
+        uploaded_path = await save_snapshot_attachment(file, output_dir)
+        input_path = await asyncio.to_thread(
+            prepare_snapshot_input,
+            uploaded_path,
+            output_dir,
+            locale="tc",
+            cache_dir=BASE_DIR / "master_cache",
+        )
+        args = SimpleNamespace(
+            json_file=input_path,
+            output_dir=output_dir,
+            master_cache=BASE_DIR / "master_cache",
+            locale="tc",
+            no_maps=False,
+        )
+        await asyncio.to_thread(build_mysekai_report, args)
+        zip_path = zip_report_dir(output_dir, f"{output_dir.name}.zip")
+        remember_analysis(ctx.author.id, "mysekai", output_dir, zip_path)
+    except (ValueError, SnapshotPipelineError) as exc:
+        await ctx.send(str(exc))
+        return
+    except Exception:
+        log.exception("MySekai snapshot analysis failed")
+        await ctx.send("分析 MySekai 檔案時發生錯誤，請確認你上傳的是原始 response、sssekai JSON 或 readable JSON。")
+        return
+
+    await ctx.send(
+        "MySekai 分析完成。第一張是當前拜訪角色＋資源統計，第二張是四張地圖的資源標示。",
+        files=[
+            discord.File(output_dir / "mysekai_current_summary.png", filename="mysekai_current_summary.png"),
+            discord.File(output_dir / "mysekai_resource_map.png", filename="mysekai_resource_map.png"),
+        ],
+    )
+
+
+async def run_profile_snapshot_analysis(
+    ctx: commands.Context,
+    file: discord.Attachment,
+    fetch_hisekai: bool,
+    fetch_top100_history: bool,
+    max_events: int,
+    send_zip: bool = True,
+) -> None:
+    output_dir = upload_output_dir(ctx, "profile")
+
+    try:
+        uploaded_path = await save_snapshot_attachment(file, output_dir)
+        input_path = await asyncio.to_thread(
+            prepare_snapshot_input,
+            uploaded_path,
+            output_dir,
+            locale="tc",
+            cache_dir=BASE_DIR / "master_cache",
+        )
+        args = SimpleNamespace(
+            json_file=input_path,
+            output_dir=output_dir,
+            master_cache=BASE_DIR / "master_cache",
+            locale="tc",
+            fetch_hisekai=fetch_hisekai,
+            server="tw",
+            timeout=15,
+            current_rank_url=None,
+            history_url=None,
+            fetch_top100_history=fetch_top100_history,
+            max_events=max(max_events, 0),
+            event_list_url="https://api.hisekai.org/{server}/event/list",
+            event_top100_url="https://api.hisekai.org/{server}/event/{event_id}/top100",
+        )
+        await asyncio.to_thread(build_profile_report, args)
+        zip_path = zip_report_dir(output_dir, f"{output_dir.name}.zip")
+        remember_analysis(ctx.author.id, "profile", output_dir, zip_path)
+    except (ValueError, SnapshotPipelineError) as exc:
+        await ctx.send(str(exc))
+        return
+    except Exception:
+        log.exception("Profile snapshot analysis failed")
+        await ctx.send("分析玩家檔案時發生錯誤，請確認你上傳的是原始 response、sssekai JSON 或 readable JSON。")
+        return
+
+    if send_zip:
+        await ctx.send(
+            "玩家檔分析完成，HTML/CSV/圖表都在 zip 裡。之後可用 `/suitemusic`、`/suiteprofile` 查詢圖片。",
+            file=discord.File(zip_path, filename=zip_path.name),
+        )
+    else:
+        await ctx.send("Suite 資料已上傳並整理完成。可使用 `/suitemusic`、`/suiteprofile` 產生圖片。")
+
+
+@bot.hybrid_command(name="analyzeprofile", description="分析上傳的玩家 JSON")
+@app_commands.describe(
+    file="原始 response、sssekai_玩家.json 或 sssekai_玩家_readable.json",
+    fetch_hisekai="是否額外查 HiSekai 即時/快取資料",
+    fetch_top100_history="是否掃描歷史 Top100，較慢",
+    max_events="歷史 Top100 最多掃描幾期，0 表示全部",
+)
+async def analyze_profile_command(
+    ctx: commands.Context,
+    file: discord.Attachment,
+    fetch_hisekai: bool = False,
+    fetch_top100_history: bool = False,
+    max_events: int = 40,
+) -> None:
+    await ctx.defer()
+    await run_profile_snapshot_analysis(ctx, file, fetch_hisekai, fetch_top100_history, max_events)
+
+
+@bot.hybrid_command(name="analyzesuite", description="分析上傳的 suite/玩家 JSON")
+@app_commands.describe(
+    file="原始 response、sssekai_suite.json、玩家 JSON 或 readable JSON",
+    fetch_hisekai="是否額外查 HiSekai 即時/快取資料",
+    fetch_top100_history="是否掃描歷史 Top100，較慢",
+    max_events="歷史 Top100 最多掃描幾期，0 表示全部",
+)
+async def analyze_suite_command(
+    ctx: commands.Context,
+    file: discord.Attachment,
+    fetch_hisekai: bool = False,
+    fetch_top100_history: bool = False,
+    max_events: int = 40,
+) -> None:
+    await ctx.defer()
+    await run_profile_snapshot_analysis(ctx, file, fetch_hisekai, fetch_top100_history, max_events)
+
+
+@bot.hybrid_command(name="uploadsuite", description="只上傳並整理 suite/玩家資料，不立即回傳整包報表")
+@app_commands.describe(
+    file="原始 response、sssekai_suite.json、玩家 JSON 或 readable JSON",
+    fetch_hisekai="是否額外查 HiSekai 即時/快取資料",
+    fetch_top100_history="是否掃描歷史 Top100，較慢",
+    max_events="歷史 Top100 最多掃描幾期，0 表示全部",
+)
+async def upload_suite_command(
+    ctx: commands.Context,
+    file: discord.Attachment,
+    fetch_hisekai: bool = False,
+    fetch_top100_history: bool = False,
+    max_events: int = 40,
+) -> None:
+    await ctx.defer()
+    await run_profile_snapshot_analysis(ctx, file, fetch_hisekai, fetch_top100_history, max_events, send_zip=False)
+
+
+@bot.hybrid_command(name="mysekairesources", description="查詢最近一次 MySekai 分析的資源統計")
+@app_commands.describe(top="最多顯示幾項，預設 20")
+async def mysekai_resources_command(ctx: commands.Context, top: int = 20) -> None:
+    output_dir = last_analysis_dir(ctx.author.id, "mysekai")
+    if not output_dir:
+        await ctx.send("還沒有你的 MySekai 分析結果，請先使用 `/analyzemysekai file` 上傳檔案。")
+        return
+
+    rows = read_csv_rows(output_dir / "mysekai_resources.csv")
+    totals: Dict[Tuple[str, str, str], int] = {}
+    sites: Dict[Tuple[str, str, str], List[str]] = {}
+    for row in rows:
+        key = (row.get("resourceName", ""), row.get("resourceType", ""), row.get("resourceId", ""))
+        try:
+            quantity = int(row.get("quantity") or 0)
+        except ValueError:
+            quantity = 0
+        totals[key] = totals.get(key, 0) + quantity
+        site_text = f"{row.get('siteName', '')} {quantity}".strip()
+        if site_text:
+            sites.setdefault(key, []).append(site_text)
+
+    count = clamp_count(top)
+    sorted_rows = sorted(totals.items(), key=lambda item: item[1], reverse=True)[:count]
+    lines = []
+    for (name, resource_type, resource_id), quantity in sorted_rows:
+        site_summary = " / ".join(sites.get((name, resource_type, resource_id), [])[:4])
+        lines.append(f"**{name or resource_id}**：{quantity}（{site_summary}）")
+    await send_query_embed(ctx, "MySekai 資源統計", lines, "這份 MySekai 報表裡沒有資源資料。")
+
+
+@bot.hybrid_command(name="mysekaivisitors", description="查詢最近一次 MySekai 分析的來訪角色")
+@app_commands.describe(top="最多顯示幾項，預設 20")
+async def mysekai_visitors_command(ctx: commands.Context, top: int = 20) -> None:
+    output_dir = last_analysis_dir(ctx.author.id, "mysekai")
+    if not output_dir:
+        await ctx.send("還沒有你的 MySekai 分析結果，請先使用 `/analyzemysekai file` 上傳檔案。")
+        return
+
+    rows = read_csv_rows(output_dir / "mysekai_visitors.csv")
+    rows.sort(key=lambda row: int(row.get("visitCount") or 0), reverse=True)
+    count = clamp_count(top)
+    lines = [
+        f"**{row.get('visitor') or row.get('groupId')}**：{row.get('visitCount', 0)} 次｜{row.get('characters', '')}"
+        for row in rows[:count]
+    ]
+    await send_query_embed(ctx, "MySekai 來訪角色", lines, "這份 MySekai 報表裡沒有來訪資料。")
+
+
+def normalize_music_status(value: str) -> str:
+    text = (value or "").strip().lower().replace(" ", "_")
+    if text in {"all_perfect", "full_perfect"} or "perfect" in text:
+        return "all_perfect"
+    if text == "full_combo" or "combo" in text:
+        return "full_combo"
+    if text == "clear":
+        return "clear"
+    if text in {"未通關", "not_clear"}:
+        return "not_clear"
+    if text in {"未記錄", "not_played", ""}:
+        return "not_played"
+    return text
+
+
+@bot.hybrid_command(name="musicstatus", description="查詢最近一次玩家分析的歌曲 Clear/FC/AP 狀態")
+@app_commands.describe(difficulty="難度", status="狀態", top="最多顯示幾首，預設 20")
+@app_commands.choices(difficulty=DIFFICULTY_CHOICES, status=MUSIC_STATUS_CHOICES)
+async def music_status_command(
+    ctx: commands.Context,
+    difficulty: str = "all",
+    status: str = "all",
+    top: int = 20,
+) -> None:
+    output_dir = last_analysis_dir(ctx.author.id, "profile")
+    if not output_dir:
+        await ctx.send("還沒有你的玩家檔分析結果，請先使用 `/analyzeprofile file` 上傳檔案。")
+        return
+
+    rows = read_csv_rows(output_dir / "profile_music_status.csv")
+    filtered = []
+    for row in rows:
+        row_difficulty = (row.get("difficulty") or "").strip().lower()
+        row_status = normalize_music_status(row.get("bestStatus", ""))
+        if difficulty != "all" and row_difficulty != difficulty:
+            continue
+        if status != "all" and row_status != status:
+            continue
+        filtered.append(row)
+
+    counts: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        row_difficulty = row.get("difficulty") or "Unknown"
+        row_status = normalize_music_status(row.get("bestStatus", ""))
+        counts.setdefault(row_difficulty, {})
+        counts[row_difficulty][row_status] = counts[row_difficulty].get(row_status, 0) + 1
+
+    status_label = {
+        "clear": "Clear",
+        "full_combo": "Full Combo",
+        "all_perfect": "All Perfect",
+        "not_clear": "未通關",
+        "not_played": "未記錄",
+    }
+    count_lines = []
+    for diff_name in ["Easy", "Normal", "Hard", "Expert", "Master", "Append"]:
+        values = counts.get(diff_name)
+        if not values:
+            continue
+        count_lines.append(
+            f"{diff_name}: "
+            + " / ".join(f"{status_label.get(key, key)} {value}" for key, value in sorted(values.items()))
+        )
+
+    count = clamp_count(top)
+    song_lines = [
+        f"`{row.get('musicId')}` **{row.get('title')}** [{row.get('difficulty')}] {row.get('bestStatus')}｜{row.get('highScore')}"
+        for row in filtered[:count]
+    ]
+    lines = count_lines + ([""] if count_lines and song_lines else []) + song_lines
+    await send_query_embed(ctx, "歌曲狀態", lines, "這份玩家報表裡沒有符合條件的歌曲資料。")
+
+
+@bot.hybrid_command(name="cardstatus", description="查詢最近一次玩家分析的卡片狀態")
+@app_commands.describe(top="最多顯示幾張，預設 20")
+async def card_status_command(ctx: commands.Context, top: int = 20) -> None:
+    output_dir = last_analysis_dir(ctx.author.id, "profile")
+    if not output_dir:
+        await ctx.send("還沒有你的玩家檔分析結果，請先使用 `/analyzeprofile file` 上傳檔案。")
+        return
+
+    rows = read_csv_rows(output_dir / "profile_cards.csv")
+    rarity_counts: Dict[str, int] = {}
+    for row in rows:
+        rarity = row.get("rarity") or "Unknown"
+        rarity_counts[rarity] = rarity_counts.get(rarity, 0) + 1
+
+    count = clamp_count(top)
+    summary = " / ".join(f"{key} {value}" for key, value in sorted(rarity_counts.items()))
+    card_lines = [
+        f"`{row.get('cardId')}` **{row.get('cardName')}**｜{row.get('character')}｜{row.get('rarity')}｜Lv {row.get('level')}｜MR {row.get('masterRank')}"
+        for row in rows[:count]
+    ]
+    lines = ([summary, ""] if summary else []) + card_lines
+    await send_query_embed(ctx, "卡片狀態", lines, "這份玩家報表裡沒有卡片資料。")
+
+
+@bot.hybrid_command(name="eventhistory", description="查詢最近一次玩家分析的活動分數和排名")
+@app_commands.describe(top="最多顯示幾期，預設 20")
+async def event_history_command(ctx: commands.Context, top: int = 20) -> None:
+    output_dir = last_analysis_dir(ctx.author.id, "profile")
+    if not output_dir:
+        await ctx.send("還沒有你的玩家檔分析結果，請先使用 `/analyzeprofile file` 上傳檔案。")
+        return
+
+    rows = read_csv_rows(output_dir / "profile_events.csv")
+    rows.sort(key=lambda row: int(row.get("eventId") or 0), reverse=True)
+    count = clamp_count(top)
+    lines = []
+    for row in rows[:count]:
+        rank = row.get("rank") or (f"Top {row.get('rankUpperBound')}" if row.get("rankUpperBound") else "排名未記錄")
+        score = row.get("score") or "分數未記錄"
+        chapter = f"｜章節 {row.get('chapter')}" if row.get("chapter") else ""
+        lines.append(f"`{row.get('eventId') or '-'}` **{row.get('eventName')}**{chapter}｜{rank}｜{score}｜{row.get('source')}")
+    await send_query_embed(ctx, "活動紀錄", lines, "這份玩家報表裡沒有活動資料。")
+
+
+@bot.hybrid_command(name="suitemusic", description="依難度種類或歌曲等級條列 Suite 歌曲通關狀態")
+@app_commands.describe(
+    mode="選擇用難度種類或歌曲等級查詢",
+    value="請用選單選 expert/master/append 或 14~38",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="難度種類", value="difficulty"),
+        app_commands.Choice(name="歌曲等級", value="level"),
+    ]
+)
+async def suite_music_image_command(
+    ctx: commands.Context,
+    mode: str = "difficulty",
+    value: str = "master",
+) -> None:
+    await ctx.defer()
+    output_dir = last_analysis_dir(ctx.author.id, "profile")
+    if not output_dir:
+        await ctx.send("還沒有你的 Suite 資料，請先使用 `/uploadsuite file` 或 `/analyzesuite file` 上傳。")
+        return
+
+    rows = read_csv_rows(output_dir / "profile_music_status.csv")
+    if not rows:
+        await ctx.send("找不到歌曲資料，請重新上傳 Suite 檔案。")
+        return
+
+    image_names = await asyncio.to_thread(draw_music_status_query_pages, rows, output_dir, mode=mode, value=value, per_page=30)
+    if not image_names:
+        await ctx.send("沒有符合條件的歌曲資料。")
+        return
+
+    for index in range(0, len(image_names), 10):
+        batch = image_names[index : index + 10]
+        files = [discord.File(output_dir / image_name, filename=image_name) for image_name in batch]
+        await ctx.send(files=files)
+
+
+@suite_music_image_command.autocomplete("value")
+async def suite_music_value_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    mode = getattr(interaction.namespace, "mode", "difficulty")
+    current = (current or "").lower()
+    if mode == "level":
+        values = [str(level) for level in range(14, 39)]
+    else:
+        values = ["expert", "master", "append"]
+    return [
+        app_commands.Choice(name=value, value=value)
+        for value in values
+        if not current or value.startswith(current)
+    ][:25]
+
+
+@bot.hybrid_command(name="suiteprofile", description="回傳 Suite 個人資料整理圖片")
+async def suite_profile_image_command(ctx: commands.Context) -> None:
+    output_dir = last_analysis_dir(ctx.author.id, "profile")
+    if not output_dir:
+        await ctx.send("還沒有你的 Suite 資料，請先使用 `/uploadsuite file` 或 `/analyzesuite file` 上傳。")
+        return
+
+    path = output_dir / "profile_overview.png"
+    if not path.exists():
+        await ctx.send("找不到個人資料圖片，請重新上傳 Suite 檔案。")
+        return
+    await ctx.send(file=discord.File(path, filename=path.name))
+
+
 @bot.hybrid_command(name="help", description="顯示指令列表")
 async def help_command(ctx: commands.Context) -> None:
     embed = discord.Embed(
@@ -1021,15 +1572,76 @@ async def help_command(ctx: commands.Context) -> None:
             "`/rankgraph mode rank` 顯示目前該名次玩家的歷史分數\n"
             "`/trackrank mode rank` 查指定名次資訊，可輸入 `14,15,16,17,18` 或 `14-18`\n"
             "`/playerrank mode` 查自己目前排名\n"
-            "`/line mode` 查活動榜線"
+            "`/line mode` 查活動榜線\n"
+            "`/analyzemysekai file` 分析 MySekai JSON，回傳資源/訪客/地圖報表\n"
+            "`/uploadsuite file` 上傳並整理 Suite/玩家資料，不立即回傳 zip\n"
+            "`/suitemusic mode value` 依難度種類或等級條列歌曲通關狀態圖，會自動分頁全送出\n"
+            "`/suiteprofile` 產生個人資料整理圖"
         ),
         color=EMBED_COLOR,
     )
     await ctx.send(embed=embed)
 
 
+LEGACY_COMMANDS = (
+    "analyzeprofile",
+    "analyzesuite",
+    "mysekairesources",
+    "mysekaivisitors",
+    "musicstatus",
+    "cardstatus",
+    "eventhistory",
+    "suiteevents",
+)
+for legacy_command in LEGACY_COMMANDS:
+    bot.remove_command(legacy_command)
+    bot.tree.remove_command(legacy_command)
+
+
+class HealthRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path not in ("/", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        payload = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        log.debug("Health check: " + format, *args)
+
+
+def start_render_health_server() -> None:
+    port = os.getenv("PORT")
+    if not port:
+        return
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", int(port)), HealthRequestHandler)
+    except ValueError as exc:
+        raise RuntimeError(f"PORT 必須是數字，目前是: {port!r}") from exc
+
+    thread = Thread(target=server.serve_forever, name="render-health-server", daemon=True)
+    thread.start()
+    log.info("Health server listening on 0.0.0.0:%s", port)
+
+
 def main() -> None:
+    load_env_file()
+    configure_data_paths()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    start_render_health_server()
+
     token = os.getenv("DISCORD_TOKEN")
+    if token == "replace_with_your_discord_bot_token":
+        raise RuntimeError(
+            ".env 裡的 DISCORD_TOKEN 還是範例文字，請到 Discord Developer Portal 重新產生 token 後填入。"
+        )
     if not token:
         raise RuntimeError(
             "找不到 DISCORD_TOKEN。請在環境變數或 .env 中設定 DISCORD_TOKEN。"
@@ -1040,8 +1652,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
