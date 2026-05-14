@@ -3,3 +3,4 @@ requests
 aiohttp
 matplotlib
 flask
+sssekai
