@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: hisekai-discord-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /healthz
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: COMMAND_PREFIX
+        value: "!"
