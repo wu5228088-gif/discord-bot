@@ -4,3 +4,4 @@ aiohttp
 matplotlib
 flask
 sssekai
+scipy
