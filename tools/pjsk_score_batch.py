@@ -344,6 +344,7 @@ def build_analysis(
             continue
         difficulty_name = difficulty["musicDifficulty"]
         sus_file = cache_dir / f"{music_id:04d}_{difficulty_name}.sus"
+        print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}")
         try:
             downloaded = download_sus(
                 music_id,
