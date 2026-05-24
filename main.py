@@ -2079,6 +2079,14 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         log.debug("Health check: " + format, *args)
 
+    def do_HEAD(self) -> None:
+        if self.path not in ("/", "/healthz"):
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        self.send_response(200)
+        self.end_headers()
 
 def start_render_health_server() -> None:
     port = os.getenv("PORT")
