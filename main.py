@@ -34,6 +34,17 @@ from tools.analyze_pjsk_snapshot import (
     draw_music_status_query,
     draw_music_status_query_pages,
 )
+from tools.pjsk_score_batch import (
+    BONUS_MULTIPLIERS,
+    build_analysis as build_pjsk_score_analysis,
+    calculate_event_points,
+    cache_path as pjsk_score_cache_path,
+    default_master_dir as pjsk_default_master_dir,
+    default_length_overrides as pjsk_length_overrides_path,
+    find_chart as find_pjsk_score_chart,
+    load_analysis as load_pjsk_score_analysis,
+    rank_charts as rank_pjsk_score_charts,
+)
 from tools.snapshot_pipeline import SnapshotPipelineError, prepare_snapshot_input
 
 
@@ -84,6 +95,27 @@ MUSIC_STATUS_CHOICES = [
     app_commands.Choice(name="All Perfect", value="all_perfect"),
     app_commands.Choice(name="未通關", value="not_clear"),
     app_commands.Choice(name="未記錄", value="not_played"),
+]
+
+BONUS_CHOICES = [
+    app_commands.Choice(name=f"{fire}火 x{multiplier}", value=fire)
+    for fire, multiplier in BONUS_MULTIPLIERS.items()
+]
+
+PJSK_SCORE_SORT_CHOICES = [
+    app_commands.Choice(name="活動pt", value="event_pt"),
+    app_commands.Choice(name="理論分數", value="score"),
+    app_commands.Choice(name="技能覆蓋率", value="skill_coverage_pct_total"),
+]
+
+PJSK_SKILL_MODE_CHOICES = [
+    app_commands.Choice(name="單一倍率套用 6 段", value="single"),
+    app_commands.Choice(name="6 段分別輸入", value="custom"),
+]
+
+PJSK_SCORE_MODE_CHOICES = [
+    app_commands.Choice(name="多人/協力：加活躍分", value="multi"),
+    app_commands.Choice(name="單人/挑戰：不加活躍分", value="solo"),
 ]
 
 CHARACTER_MAP = {
@@ -1561,6 +1593,434 @@ async def suite_profile_image_command(ctx: commands.Context) -> None:
     await ctx.send(file=discord.File(path, filename=path.name))
 
 
+def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
+    return load_pjsk_score_analysis(DATA_DIR)
+
+
+def resolve_skill_multipliers(
+    mode: str = "single",
+    skill_multiplier: float = 3.7,
+    skill1: Optional[float] = None,
+    skill2: Optional[float] = None,
+    skill3: Optional[float] = None,
+    skill4: Optional[float] = None,
+    skill5: Optional[float] = None,
+    skill6: Optional[float] = None,
+) -> list[float]:
+    default_multiplier = 3.7 if skill_multiplier is None else float(skill_multiplier)
+    if mode == "custom":
+        values = [skill1, skill2, skill3, skill4, skill5, skill6]
+        return [float(value if value is not None else default_multiplier) for value in values]
+    return [default_multiplier] * 6
+
+
+def active_bonus_power_multiplier_for_mode(mode: str) -> float:
+    # Multi-live active bonus is independent score: five players' total power * 7.5%.
+    # With the bot assumption that all five players have the input power, this adds
+    # input_power * 5 * 0.075 = input_power * 0.375 to the final score.
+    return 0.375 if mode == "multi" else 0.0
+
+
+def format_number_range(low: float, high: float, *, digits: int = 0, suffix: str = "") -> str:
+    if abs(low - high) < 10 ** (-(digits + 1)):
+        return f"{low:.{digits}f}{suffix}"
+    return f"{low:.{digits}f}-{high:.{digits}f}{suffix}"
+
+
+def format_skill_coverages(
+    chart: dict[str, Any],
+    skill_multipliers: list[float] | None = None,
+    *,
+    team_power: int | None = None,
+    total_score: float | None = None,
+    use_fever: bool = True,
+) -> str:
+    multipliers = skill_multipliers or [3.7] * 6
+    parts = []
+    suffix = "" if use_fever else "_no_fever"
+    skill_terms = chart.get(f"skill_score_terms{suffix}") or chart.get("skill_score_terms") or []
+    skill_terms_min = chart.get(f"skill_score_terms_min{suffix}") or chart.get("skill_score_terms_min") or skill_terms
+    skill_terms_max = chart.get(f"skill_score_terms_max{suffix}") or chart.get("skill_score_terms_max") or skill_terms
+    
+    for row in chart.get("skill_coverages", [])[:6]:
+        index = int(row["index"])
+        multiplier = multipliers[index - 1] if index - 1 < len(multipliers) else multipliers[-1]
+        fever_weight = float(row.get("fever_covered_weight") or 0)
+        
+        segment_score_min = None
+        segment_score_max = None
+        segment_pct_min = None
+        segment_pct_max = None
+        segment_multiplier_min = None
+        segment_multiplier_max = None
+        
+        if index - 1 < len(skill_terms):
+            segment_multiplier_min = float(skill_terms_min[index - 1]) * multiplier
+            segment_multiplier_max = float(skill_terms_max[index - 1]) * multiplier
+            
+            if team_power is not None and total_score:
+                segment_score_min = segment_multiplier_min * team_power
+                segment_score_max = segment_multiplier_max * team_power
+                segment_pct_min = segment_score_min / total_score * 100 if total_score else 0.0
+                segment_pct_max = segment_score_max / total_score * 100 if total_score else 0.0
+
+        coverage_low = float(row.get("coverage_pct_min", row["coverage_pct"]))
+        coverage_high = float(row.get("coverage_pct_max", row["coverage_pct"]))
+        coverage_text = format_number_range(coverage_low, coverage_high, digits=2, suffix="%")
+        
+        # 根據有沒有綜合力，決定要顯示絕對分數還是倍率
+        if team_power is not None and segment_score_min is not None:
+            score_text = (
+                "｜段分數 "
+                f"{format_number_range(segment_score_min, segment_score_max, digits=0)} "
+                f"({format_number_range(segment_pct_min, segment_pct_max, digits=2, suffix='%')})"
+            )
+        elif segment_multiplier_min is not None:
+            score_text = (
+                "｜段分數 "
+                f"{format_number_range(segment_multiplier_min, segment_multiplier_max, digits=4, suffix='x')}"
+            )
+        else:
+            score_text = ""
+            
+        fever_tag = f"｜fever重疊 {float(row.get('fever_overlap_pct') or 0):.1f}%" if fever_weight > 0 else ""
+        line = f"S{index} x{multiplier:g}: 覆蓋 {coverage_text}{score_text}{fever_tag}"
+        if fever_weight > 0:
+            line = f"**{line}**"
+        parts.append(line)
+        
+    return "\n".join(parts) if parts else "沒有技能段資料"
+
+
+def format_score_rank_line(index: int, row: dict[str, Any], sort_by: str) -> str:
+    length_note = " 缺長度" if row.get("length_missing") else ""
+    prefix = f"`#{index:02d}` **{row['title']}** {row['difficulty'].upper()} Lv.{row['level']}｜"
+    if sort_by == "event_pt":
+        pt_text = format_number_range(
+            float(row.get("event_pt_min", row["event_pt"])),
+            float(row.get("event_pt_max", row["event_pt"])),
+            digits=0,
+        )
+        return f"{prefix}{pt_text}pt{length_note}"
+    if sort_by == "score":
+        score_text = format_number_range(
+            float(row.get("score_min", row["score"])),
+            float(row.get("score_max", row["score"])),
+            digits=0,
+        )
+        return f"{prefix}理論分數 {score_text}"
+    score_text = ""
+    if row.get("score") is not None:
+        score_text = "｜理論分數 " + format_number_range(
+            float(row.get("score_min", row["score"])),
+            float(row.get("score_max", row["score"])),
+            digits=0,
+        )
+    return f"{prefix}技能 {row['skill_coverage_pct_total']:.2f}%{score_text}"
+
+
+@bot.hybrid_command(name="pjskupdatescores", description="下載/分析全歌曲 SUS，建立技能覆蓋率與理論分數快取")
+@app_commands.describe(
+    difficulty="只更新特定難度，預設全部",
+    force_download="重新下載已快取的 SUS",
+    limit="測試用，只處理前 N 張譜，正式更新請留空",
+)
+@app_commands.choices(difficulty=DIFFICULTY_CHOICES)
+async def pjsk_update_scores_command(
+    ctx: commands.Context,
+    difficulty: str = "all",
+    force_download: bool = False,
+    limit: Optional[int] = None,
+) -> None:
+    await ctx.defer()
+    selected = None if difficulty == "all" else {difficulty}
+    payload = await asyncio.to_thread(
+        build_pjsk_score_analysis,
+        DATA_DIR,
+        master_dir=pjsk_default_master_dir(),
+        force_download=force_download,
+        difficulties=selected,
+        limit=limit,
+    )
+    cache_file = pjsk_score_cache_path(DATA_DIR)
+    length_file = pjsk_length_overrides_path(DATA_DIR)
+    mismatch_count = sum(1 for chart in payload.get("charts", []) if not chart.get("combo_match"))
+    missing_length_count = sum(1 for chart in payload.get("charts", []) if chart.get("length_multiplier") is None)
+    await ctx.send(
+        "更新完成："
+        f"成功 `{payload['chart_count']}` 張譜，失敗 `{payload['error_count']}` 張。"
+        f"\nCombo 不一致 `{mismatch_count}` 張，缺長度倍率 `{missing_length_count}` 張。"
+        f"\n快取：`{cache_file}`"
+        f"\n長度倍率補檔：`{length_file}`"
+    )
+
+
+@bot.hybrid_command(name="pjsklengthfile", description="取得可手動補長度倍率的 CSV 檔")
+async def pjsk_length_file_command(ctx: commands.Context) -> None:
+    path = pjsk_length_overrides_path(DATA_DIR)
+    if not path.exists():
+        await ctx.send("還沒有長度倍率補檔，請先跑 `/pjskupdatescores` 產生。")
+        return
+    await ctx.send(
+        "把 `length_multiplier` 欄位填好後，再跑 `/pjskupdatescores` 會自動套用。",
+        file=discord.File(path, filename=path.name),
+    )
+
+
+@bot.hybrid_command(name="pjskrank", description="依綜合力/活動倍率/火數計算活動pt排行")
+@app_commands.describe(
+    power="綜合力；依活動pt/理論分數排行時需要",
+    event_multiplier="活動倍率，依活動pt排行時使用，預設 1",
+    bonus="bonus 消耗，預設 5 火",
+    score_mode="分數模式，多人套 fever 與活躍分，單人不套",
+    skill_mode="技能倍率輸入方式",
+    skill_multiplier="單一技能倍率，預設 3.7",
+    skill1="第 1 段技能倍率，skill_mode=6段分別輸入時使用",
+    skill2="第 2 段技能倍率",
+    skill3="第 3 段技能倍率",
+    skill4="第 4 段技能倍率",
+    skill5="第 5 段技能倍率",
+    skill6="第 6 段技能倍率",
+    difficulty="難度，預設全部",
+    start_rank="起始名次，預設 1",
+    end_rank="結束名次，最多回傳 50 筆，預設10筆",
+    sort_by="排序依據",
+)
+@app_commands.choices(
+    difficulty=DIFFICULTY_CHOICES,
+    bonus=BONUS_CHOICES,
+    sort_by=PJSK_SCORE_SORT_CHOICES,
+    skill_mode=PJSK_SKILL_MODE_CHOICES,
+    score_mode=PJSK_SCORE_MODE_CHOICES,
+)
+async def pjsk_rank_command(
+    ctx: commands.Context,
+    power: Optional[int] = None,
+    event_multiplier: float = 1.0,
+    bonus: int = 5,
+    score_mode: str = "multi",
+    skill_mode: str = "single",
+    skill_multiplier: Optional[float] = None,
+    skill1: Optional[float] = None,
+    skill2: Optional[float] = None,
+    skill3: Optional[float] = None,
+    skill4: Optional[float] = None,
+    skill5: Optional[float] = None,
+    skill6: Optional[float] = None,
+    difficulty: str = "all",
+    start_rank: int = 1,
+    end_rank: int = 10,
+    sort_by: str = "event_pt",
+) -> None:
+    analysis = load_pjsk_score_cache_or_none()
+    if not analysis:
+        await ctx.send("還沒有分析快取，請先跑 `/pjskupdatescores`。")
+        return
+    if sort_by in {"event_pt", "score"} and power is None:
+        await ctx.send("依活動pt或理論分數排行需要填 `power`；若只想看覆蓋率，排序請選 `技能覆蓋率`。")
+        return
+    start_rank = max(1, start_rank)
+    end_rank = max(start_rank, end_rank)
+    end_rank = min(end_rank, start_rank + 49)
+    skill_multipliers = resolve_skill_multipliers(
+        skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
+    )
+    active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
+    use_fever = score_mode == "multi"
+    if power is None:
+        rows = []
+        for chart in analysis.get("charts", []):
+            if difficulty != "all" and chart["difficulty"] != difficulty:
+                continue
+            skill_total = sum(float(row["covered_weight"]) for row in chart.get("skill_coverages", []))
+            rows.append(
+                {
+                    **chart,
+                    "skill_coverage_pct_total": skill_total / chart["total_weight"] * 100
+                    if chart["total_weight"]
+                    else 0.0,
+                    "score": None,
+                }
+            )
+        rows.sort(key=lambda row: row["skill_coverage_pct_total"], reverse=True)
+    else:
+        rows = rank_pjsk_score_charts(
+            analysis,
+            team_power=power,
+            event_multiplier=event_multiplier,
+            bonus=bonus,
+            skill_multipliers=skill_multipliers,
+            active_bonus_power_multiplier=active_bonus,
+            use_fever=use_fever,
+            difficulty=difficulty,
+            sort_by=sort_by,
+        )
+    if not rows:
+        await ctx.send("沒有符合條件的譜面資料。")
+        return
+    page = rows[start_rank - 1 : end_rank]
+    skill_label = "技能 " + "/".join(f"{value:g}" for value in skill_multipliers)
+    mode_label = "多人" if score_mode == "multi" else "單人/挑戰"
+    power_label = f"{power:,}" if power is not None else "未填綜合力"
+    title = f"PJSK 排行 {start_rank}-{start_rank + len(page) - 1}｜{mode_label}｜{power_label}｜活動倍率 {event_multiplier:g}｜{bonus}火｜{skill_label}"
+    await send_query_embed(
+        ctx,
+        title,
+        [format_score_rank_line(i, row, sort_by) for i, row in enumerate(page, start=start_rank)],
+        "沒有排行資料。",
+    )
+
+@bot.hybrid_command(name="pjskchart", description="查詢單曲的技能覆蓋率、理論分數與預測活動pt")
+@app_commands.describe(
+    song="曲名或歌曲 ID，可輸入關鍵字",
+    difficulty="難度",
+    power="綜合力；不填則只顯示覆蓋率與分數倍率",
+    event_multiplier="活動倍率，預設 1",
+    bonus="bonus 消耗，預設 5 火",
+    score_mode="分數模式，多人套 fever 與活躍分，單人不套",
+    skill_mode="技能倍率輸入方式",
+    skill_multiplier="單一技能倍率，預設 3.7",
+    skill1="第 1 段技能倍率，skill_mode=6段分別輸入時使用",
+    skill2="第 2 段技能倍率",
+    skill3="第 3 段技能倍率",
+    skill4="第 4 段技能倍率",
+    skill5="第 5 段技能倍率",
+    skill6="第 6 段技能倍率",
+)
+@app_commands.choices(
+    difficulty=[choice for choice in DIFFICULTY_CHOICES if choice.value != "all"],
+    bonus=BONUS_CHOICES,
+    skill_mode=PJSK_SKILL_MODE_CHOICES,
+    score_mode=PJSK_SCORE_MODE_CHOICES,
+)
+async def pjsk_chart_command(
+    ctx: commands.Context,
+    song: str,
+    difficulty: str,
+    power: Optional[int] = None,
+    event_multiplier: float = 1.0,
+    bonus: int = 5,
+    score_mode: str = "multi",
+    skill_mode: str = "single",
+    skill_multiplier: Optional[float] = None,
+    skill1: Optional[float] = None,
+    skill2: Optional[float] = None,
+    skill3: Optional[float] = None,
+    skill4: Optional[float] = None,
+    skill5: Optional[float] = None,
+    skill6: Optional[float] = None,
+) -> None:
+    analysis = load_pjsk_score_cache_or_none()
+    if not analysis:
+        await ctx.send("還沒有分析快取，請先跑 `/pjskupdatescores`。")
+        return
+    chart = find_pjsk_score_chart(analysis, song, difficulty)
+    if not chart:
+        await ctx.send("找不到這首歌/難度；可以用歌曲 ID 或更完整的曲名試一次。")
+        return
+    skill_multipliers = resolve_skill_multipliers(
+        skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
+    )
+    active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
+    use_fever = score_mode == "multi"
+    
+    # 不管有沒有填綜合力，都先假定至少為 1 算一次，藉此拿精準的倍率
+    dummy_power = power if power is not None else 1
+    calc = calculate_event_points(chart, dummy_power, event_multiplier, bonus, skill_multipliers, active_bonus, use_fever)
+    
+    fever = chart.get("fever", {})
+    length_multiplier = calc["length_multiplier"]
+    length_text = str(length_multiplier) if length_multiplier is not None else "缺資料，暫用 1.0"
+    
+    # 根據有沒有填綜合力，決定顯示文字
+    if power is not None:
+        score_text = format_number_range(
+            float(calc.get("score_min", calc["score"])),
+            float(calc.get("score_max", calc["score"])),
+            digits=0,
+        )
+        pt_text = format_number_range(
+            float(calc.get("event_pt_min", calc["event_pt"])),
+            float(calc.get("event_pt_max", calc["event_pt"])),
+            digits=0,
+        )
+        # 刪除了這邊重複的長度倍率
+        score_line = f"\n理論分數 `{score_text}`｜預測活動pt `{pt_text}`"
+    else:
+        score_multiplier_text = format_number_range(
+            float(calc.get("score_power_multiplier_min", calc["score_power_multiplier"])),
+            float(calc.get("score_power_multiplier_max", calc["score_power_multiplier"])),
+            digits=4,
+            suffix="x",
+        )
+        score_line = f"\n理論分數 `{score_multiplier_text} 綜合力`"
+
+    embed = discord.Embed(
+        title=f"{chart['title']}｜{difficulty.upper()} Lv.{chart['level']}",
+        description=(
+            f"Combo `{chart['parsed_combo']}/{chart['official_combo']}`｜"
+            f"加權 note `{chart['total_weight']:.1f}`｜長度倍率 `{length_text}`"
+            f"{score_line}"
+        ),
+        color=EMBED_COLOR,
+    )
+    skill_total = sum(float(row["covered_weight"]) for row in chart.get("skill_coverages", []))
+    skill_total_pct = skill_total / chart["total_weight"] * 100 if chart["total_weight"] else 0.0
+    mode_text = "多人/協力" if score_mode == "multi" else "單人/挑戰"
+    embed.add_field(name="分數模式", value=mode_text, inline=False)
+    embed.add_field(name="總技能覆蓋率", value=f"{skill_total_pct:.2f}%", inline=False)
+    embed.add_field(name="技能倍率", value="/".join(f"x{value:g}" for value in skill_multipliers), inline=False)
+    embed.add_field(
+        name="6 段技能覆蓋率 / 段分數",
+        value=format_skill_coverages(
+            chart,
+            skill_multipliers,
+            team_power=power,
+            total_score=calc["score"] if power is not None else None,
+            use_fever=use_fever,
+        ),
+        inline=False,
+    )
+    if use_fever:
+        embed.add_field(
+            name="Fever",
+            value=(
+                f"combo {fever.get('combo_start')}-{fever.get('combo_end')}｜"
+                f"加權覆蓋 {float(fever.get('coverage_pct') or 0):.2f}%"
+            ),
+            inline=False,
+        )
+    await ctx.send(embed=embed)
+
+
+@pjsk_chart_command.autocomplete("song")
+async def pjsk_chart_song_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    analysis = load_pjsk_score_cache_or_none()
+    if not analysis:
+        return []
+    difficulty = getattr(interaction.namespace, "difficulty", None)
+    current_norm = (current or "").lower()
+    seen: set[int] = set()
+    choices: list[app_commands.Choice[str]] = []
+    for chart in analysis.get("charts", []):
+        if difficulty and chart["difficulty"] != difficulty:
+            continue
+        title = chart["title"]
+        if current_norm and current_norm not in title.lower() and current_norm not in str(chart["music_id"]):
+            continue
+        if chart["music_id"] in seen:
+            continue
+        seen.add(chart["music_id"])
+        label = f"{chart['music_id']:04d} {title}"
+        choices.append(app_commands.Choice(name=label[:100], value=title[:100]))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 @bot.hybrid_command(name="help", description="顯示指令列表")
 async def help_command(ctx: commands.Context) -> None:
     embed = discord.Embed(
@@ -1576,7 +2036,11 @@ async def help_command(ctx: commands.Context) -> None:
             "`/analyzemysekai file` 分析 MySekai JSON，回傳資源/訪客/地圖報表\n"
             "`/uploadsuite file` 上傳並整理 Suite/玩家資料，不立即回傳 zip\n"
             "`/suitemusic mode value` 依難度種類或等級條列歌曲通關狀態圖，會自動分頁全送出\n"
-            "`/suiteprofile` 產生個人資料整理圖"
+            "`/suiteprofile` 產生個人資料整理圖\n"
+            "`/pjskupdatescores` 下載並分析 SUS 分數資料\n"
+            "`/pjskrank` 查技能覆蓋/理論分數/活動pt排行\n"
+            "`/pjskchart song difficulty` 查單曲分數細節，綜合力可留空\n"
+            "`/pjsklengthfile` 取得可手動補長度倍率的 CSV"
         ),
         color=EMBED_COLOR,
     )
