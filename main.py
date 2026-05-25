@@ -1020,6 +1020,25 @@ async def tracker() -> None:
     except Exception:
         log.exception("背景追蹤更新失敗")
 
+@tasks.loop(hours=24)
+async def auto_update_pjsk_scores() -> None:
+    log.info("開始執行每日自動檢查新歌曲...")
+    try:
+        # 放到背景執行，才不會讓 Discord 機器人卡死
+        await asyncio.to_thread(
+            build_pjsk_score_analysis,
+            DATA_DIR,
+            master_dir=pjsk_default_master_dir(),
+            force_download=False,
+            auto_update_menu=True  # 👈 開啟我們剛剛加的自動更新菜單功能
+        )
+        log.info("每日新歌檢查與快取更新完畢！")
+    except Exception as e:
+        log.exception(f"每日自動更新失敗: {e}")
+
+@auto_update_pjsk_scores.before_loop
+async def before_auto_update_pjsk_scores() -> None:
+    await bot.wait_until_ready()
 
 @tracker.before_loop
 async def before_tracker() -> None:
@@ -1030,6 +1049,9 @@ async def before_tracker() -> None:
 async def on_ready() -> None:
     if not tracker.is_running():
         tracker.start()
+
+    if not auto_update_pjsk_scores.is_running():
+        auto_update_pjsk_scores.start()
 
     if not bot.synced_commands_once:
         try:
