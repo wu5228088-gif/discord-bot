@@ -295,6 +295,26 @@ def analyze_chart(
         "sus_file": str(sus_file),
     }
 
+def update_master_cache(master_dir: Path) -> bool:
+    print("正在從遠端更新 musics.json 與 musicDifficulties.json ...")
+    try:
+        master_dir.mkdir(parents=True, exist_ok=True)
+        # 使用 sekai-world API 抓取最新日版歌曲資料 (確保能抓到最新推出的歌)
+        base_url = "https://sekai-world.github.io/sekai-master-db-diff"
+        
+        res_m = requests.get(f"{base_url}/musics.json", timeout=15)
+        res_m.raise_for_status()
+        (master_dir / "musics.json").write_text(res_m.text, encoding="utf-8")
+        
+        res_d = requests.get(f"{base_url}/musicDifficulties.json", timeout=15)
+        res_d.raise_for_status()
+        (master_dir / "musicDifficulties.json").write_text(res_d.text, encoding="utf-8")
+        
+        print("✅ 歌曲菜單更新成功！")
+        return True
+    except Exception as e:
+        print(f"❌ 更新歌曲菜單失敗: {e}")
+        return False
 
 def build_analysis(
     data_dir: Path,
@@ -307,7 +327,10 @@ def build_analysis(
     limit: int | None = None,
     assets_host: str = ASSETS_HOST,
     sleep_sec: float = 0.03,
+    auto_update_menu: bool = False,
 ) -> dict[str, Any]:
+    if auto_update_menu:
+        update_master_cache(master_dir)
     musics, master_difficulties = load_master(master_dir)
     length_lookup = load_length_multipliers_with_ids(length_xlsx, length_overrides or default_length_overrides(data_dir))
     charts: list[dict[str, Any]] = []
