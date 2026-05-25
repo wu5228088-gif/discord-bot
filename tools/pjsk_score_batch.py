@@ -316,6 +316,22 @@ def update_master_cache(master_dir: Path) -> bool:
         print(f"❌ 更新歌曲菜單失敗: {e}")
         return False
 
+def update_length_overrides_from_google(data_dir: Path) -> None:
+    # 👇 把你剛剛複製的超長網址貼在引號裡面 👇
+    google_csv_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrxLZNUjy8RctfuipN89XyM6VXsANmkDgKOVrOZeC7fdBsPDL4_pHBpDW7yvdrUI4W09XmUAApbgpC/pub?output=csv"
+    
+    print("正在從 Google 試算表下載最新的長度倍率...")
+    try:
+        res = requests.get(google_csv_url, timeout=10)
+        res.raise_for_status()
+        
+        # 下載成功後，直接覆蓋掉本地的 pjsk_length_overrides.csv
+        target_path = data_dir / "pjsk_length_overrides.csv"
+        target_path.write_text(res.text, encoding="utf-8-sig")
+        print("✅ 長度倍率表更新成功！")
+    except Exception as e:
+        print(f"⚠️ 無法下載 Google 試算表，將使用舊有快取: {e}")
+
 def build_analysis(
     data_dir: Path,
     *,
@@ -331,6 +347,7 @@ def build_analysis(
 ) -> dict[str, Any]:
     if auto_update_menu:
         update_master_cache(master_dir)
+        update_length_overrides_from_google(data_dir)
     musics, master_difficulties = load_master(master_dir)
     length_lookup = load_length_multipliers_with_ids(length_xlsx, length_overrides or default_length_overrides(data_dir))
     charts: list[dict[str, Any]] = []
