@@ -324,6 +324,7 @@ def update_length_overrides_from_google(data_dir: Path) -> None:
     try:
         res = requests.get(google_csv_url, timeout=10)
         res.raise_for_status()
+        res.encoding = 'utf-8'
         
         # 下載成功後，直接覆蓋掉本地的 pjsk_length_overrides.csv
         target_path = data_dir / "pjsk_length_overrides.csv"
