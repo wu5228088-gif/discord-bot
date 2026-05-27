@@ -1763,6 +1763,7 @@ async def pjsk_update_scores_command(
         force_download=force_download,
         difficulties=selected,
         limit=limit,
+        auto_update_menu=True,
     )
     cache_file = pjsk_score_cache_path(DATA_DIR)
     length_file = pjsk_length_overrides_path(DATA_DIR)
