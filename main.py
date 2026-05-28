@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
@@ -1615,8 +1614,22 @@ async def suite_profile_image_command(ctx: commands.Context) -> None:
     await ctx.send(file=discord.File(path, filename=path.name))
 
 
+PJSK_SCORE_ANALYSIS_CACHE: dict[str, Any] | None = None
+PJSK_SCORE_ANALYSIS_CACHE_MTIME: float | None = None
+
+
 def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
-    return load_pjsk_score_analysis(DATA_DIR)
+    global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
+    cache_file = pjsk_score_cache_path(DATA_DIR)
+    if not cache_file.exists():
+        PJSK_SCORE_ANALYSIS_CACHE = None
+        PJSK_SCORE_ANALYSIS_CACHE_MTIME = None
+        return None
+    mtime = cache_file.stat().st_mtime
+    if PJSK_SCORE_ANALYSIS_CACHE is None or PJSK_SCORE_ANALYSIS_CACHE_MTIME != mtime:
+        PJSK_SCORE_ANALYSIS_CACHE = load_pjsk_score_analysis(DATA_DIR)
+        PJSK_SCORE_ANALYSIS_CACHE_MTIME = mtime
+    return PJSK_SCORE_ANALYSIS_CACHE
 
 
 def resolve_skill_multipliers(
@@ -1766,6 +1779,9 @@ async def pjsk_update_scores_command(
         auto_update_menu=True,
     )
     cache_file = pjsk_score_cache_path(DATA_DIR)
+    global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
+    PJSK_SCORE_ANALYSIS_CACHE = payload
+    PJSK_SCORE_ANALYSIS_CACHE_MTIME = cache_file.stat().st_mtime if cache_file.exists() else None
     length_file = pjsk_length_overrides_path(DATA_DIR)
     mismatch_count = sum(1 for chart in payload.get("charts", []) if not chart.get("combo_match"))
     missing_length_count = sum(1 for chart in payload.get("charts", []) if chart.get("length_multiplier") is None)
