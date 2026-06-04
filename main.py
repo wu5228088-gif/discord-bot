@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
@@ -1019,38 +1020,43 @@ async def tracker() -> None:
     except Exception:
         log.exception("背景追蹤更新失敗")
 
-@tasks.loop(hours=24)
-async def auto_update_pjsk_scores() -> None:
-    log.info("開始執行每日自動檢查新歌曲...")
-    try:
-        # 放到背景執行，才不會讓 Discord 機器人卡死
-        await asyncio.to_thread(
-            build_pjsk_score_analysis,
-            DATA_DIR,
-            master_dir=pjsk_default_master_dir(),
-            force_download=False,
-            auto_update_menu=True  # 👈 開啟我們剛剛加的自動更新菜單功能
-        )
-        log.info("每日新歌檢查與快取更新完畢！")
-    except Exception as e:
-        log.exception(f"每日自動更新失敗: {e}")
-
-@auto_update_pjsk_scores.before_loop
-async def before_auto_update_pjsk_scores() -> None:
-    await bot.wait_until_ready()
 
 @tracker.before_loop
 async def before_tracker() -> None:
     await bot.wait_until_ready()
 
 
+async def ensure_pjsk_score_cache_on_startup() -> None:
+    cache_file = pjsk_score_cache_path(DATA_DIR)
+    if cache_file.exists():
+        log.info("PJSK score cache already exists; startup full analysis skipped: %s", cache_file)
+        return
+
+    log.info("PJSK score cache is missing; building full SUS analysis cache on startup.")
+    try:
+        await asyncio.to_thread(
+            build_pjsk_score_analysis,
+            DATA_DIR,
+            master_dir=pjsk_default_master_dir(),
+            force_download=False,
+            auto_update_menu=True,
+        )
+        global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
+        PJSK_SCORE_ANALYSIS_CACHE = load_pjsk_score_analysis(DATA_DIR)
+        PJSK_SCORE_ANALYSIS_CACHE_MTIME = cache_file.stat().st_mtime if cache_file.exists() else None
+        log.info("PJSK startup SUS analysis cache build finished.")
+    except Exception:
+        log.exception("PJSK startup SUS analysis cache build failed")
+
+
 @bot.event
 async def on_ready() -> None:
+    if not getattr(bot, "pjsk_startup_cache_task_started", False):
+        bot.pjsk_startup_cache_task_started = True
+        bot.loop.create_task(ensure_pjsk_score_cache_on_startup())
+
     if not tracker.is_running():
         tracker.start()
-
-    if not auto_update_pjsk_scores.is_running():
-        auto_update_pjsk_scores.start()
 
     if not bot.synced_commands_once:
         try:
@@ -1614,22 +1620,8 @@ async def suite_profile_image_command(ctx: commands.Context) -> None:
     await ctx.send(file=discord.File(path, filename=path.name))
 
 
-PJSK_SCORE_ANALYSIS_CACHE: dict[str, Any] | None = None
-PJSK_SCORE_ANALYSIS_CACHE_MTIME: float | None = None
-
-
 def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
-    global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
-    cache_file = pjsk_score_cache_path(DATA_DIR)
-    if not cache_file.exists():
-        PJSK_SCORE_ANALYSIS_CACHE = None
-        PJSK_SCORE_ANALYSIS_CACHE_MTIME = None
-        return None
-    mtime = cache_file.stat().st_mtime
-    if PJSK_SCORE_ANALYSIS_CACHE is None or PJSK_SCORE_ANALYSIS_CACHE_MTIME != mtime:
-        PJSK_SCORE_ANALYSIS_CACHE = load_pjsk_score_analysis(DATA_DIR)
-        PJSK_SCORE_ANALYSIS_CACHE_MTIME = mtime
-    return PJSK_SCORE_ANALYSIS_CACHE
+    return load_pjsk_score_analysis(DATA_DIR)
 
 
 def resolve_skill_multipliers(
@@ -1776,12 +1768,8 @@ async def pjsk_update_scores_command(
         force_download=force_download,
         difficulties=selected,
         limit=limit,
-        auto_update_menu=True,
     )
     cache_file = pjsk_score_cache_path(DATA_DIR)
-    global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
-    PJSK_SCORE_ANALYSIS_CACHE = payload
-    PJSK_SCORE_ANALYSIS_CACHE_MTIME = cache_file.stat().st_mtime if cache_file.exists() else None
     length_file = pjsk_length_overrides_path(DATA_DIR)
     mismatch_count = sum(1 for chart in payload.get("charts", []) if not chart.get("combo_match"))
     missing_length_count = sum(1 for chart in payload.get("charts", []) if chart.get("length_multiplier") is None)
@@ -2118,14 +2106,6 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         log.debug("Health check: " + format, *args)
 
-    def do_HEAD(self) -> None:
-        if self.path not in ("/", "/healthz"):
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        self.send_response(200)
-        self.end_headers()
 
 def start_render_health_server() -> None:
     port = os.getenv("PORT")
