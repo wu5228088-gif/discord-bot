@@ -225,6 +225,35 @@ def cached_sus_keys(cache_dir: Path) -> set[tuple[int, str]]:
     return keys
 
 
+def resolve_length_multiplier(
+    music: dict[str, Any],
+    difficulty_name: str,
+    length_lookup: tuple[dict[tuple[str, str], float], dict[str, float]]
+    | tuple[dict[tuple[str, str], float], dict[str, float], dict[tuple[int, str], float], dict[int, float]],
+) -> tuple[float | None, str | None]:
+    if len(length_lookup) == 4:
+        length_by_difficulty, length_by_title, length_by_id_difficulty, length_by_id = length_lookup
+    else:
+        length_by_difficulty, length_by_title = length_lookup
+        length_by_id_difficulty = {}
+        length_by_id = {}
+
+    normalized_title = normalize_title(music["title"])
+    music_id = int(music["id"])
+    length_multiplier = length_by_id_difficulty.get((music_id, difficulty_name))
+    length_source = "music_id+difficulty" if length_multiplier is not None else None
+    if length_multiplier is None:
+        length_multiplier = length_by_difficulty.get((normalized_title, difficulty_name))
+        length_source = "difficulty" if length_multiplier is not None else None
+    if length_multiplier is None:
+        length_multiplier = length_by_id.get(music_id)
+        length_source = "music_id" if length_multiplier is not None else None
+    if length_multiplier is None:
+        length_multiplier = length_by_title.get(normalized_title)
+        length_source = "title" if length_multiplier is not None else None
+    return length_multiplier, length_source
+
+
 def analyze_chart(
     sus_file: Path,
     difficulty: dict[str, Any],
@@ -241,25 +270,8 @@ def analyze_chart(
         official_combo=official_combo,
         fever_multiplier=1.0,
     )
-    if len(length_lookup) == 4:
-        length_by_difficulty, length_by_title, length_by_id_difficulty, length_by_id = length_lookup
-    else:
-        length_by_difficulty, length_by_title = length_lookup
-        length_by_id_difficulty = {}
-        length_by_id = {}
-    normalized_title = normalize_title(music["title"])
     music_id = int(music["id"])
-    length_multiplier = length_by_id_difficulty.get((music_id, difficulty_name))
-    length_source = "music_id+difficulty" if length_multiplier is not None else None
-    if length_multiplier is None:
-        length_multiplier = length_by_difficulty.get((normalized_title, difficulty_name))
-        length_source = "difficulty" if length_multiplier is not None else None
-    if length_multiplier is None:
-        length_multiplier = length_by_id.get(music_id)
-        length_source = "music_id" if length_multiplier is not None else None
-    if length_multiplier is None:
-        length_multiplier = length_by_title.get(normalized_title)
-        length_source = "title" if length_multiplier is not None else None
+    length_multiplier, length_source = resolve_length_multiplier(music, difficulty_name, length_lookup)
     combo_match = official_combo == int(result["combo_count_used"])
     return {
         "music_id": music_id,
@@ -295,43 +307,6 @@ def analyze_chart(
         "sus_file": str(sus_file),
     }
 
-def update_master_cache(master_dir: Path) -> bool:
-    print("正在從遠端更新 musics.json 與 musicDifficulties.json ...")
-    try:
-        master_dir.mkdir(parents=True, exist_ok=True)
-        # 使用 sekai-world API 抓取最新日版歌曲資料 (確保能抓到最新推出的歌)
-        base_url = "https://sekai-world.github.io/sekai-master-db-diff"
-        
-        res_m = requests.get(f"{base_url}/musics.json", timeout=15)
-        res_m.raise_for_status()
-        (master_dir / "musics.json").write_text(res_m.text, encoding="utf-8")
-        
-        res_d = requests.get(f"{base_url}/musicDifficulties.json", timeout=15)
-        res_d.raise_for_status()
-        (master_dir / "musicDifficulties.json").write_text(res_d.text, encoding="utf-8")
-        
-        print("✅ 歌曲菜單更新成功！")
-        return True
-    except Exception as e:
-        print(f"❌ 更新歌曲菜單失敗: {e}")
-        return False
-
-def update_length_overrides_from_google(data_dir: Path) -> None:
-    # 👇 把你剛剛複製的超長網址貼在引號裡面 👇
-    google_csv_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrxLZNUjy8RctfuipN89XyM6VXsANmkDgKOVrOZeC7fdBsPDL4_pHBpDW7yvdrUI4W09XmUAApbgpC/pub?output=csv"
-    
-    print("正在從 Google 試算表下載最新的長度倍率...")
-    try:
-        res = requests.get(google_csv_url, timeout=10)
-        res.raise_for_status()
-        res.encoding = 'utf-8'
-        
-        # 下載成功後，直接覆蓋掉本地的 pjsk_length_overrides.csv
-        target_path = data_dir / "pjsk_length_overrides.csv"
-        target_path.write_text(res.text, encoding="utf-8-sig")
-        print("✅ 長度倍率表更新成功！")
-    except Exception as e:
-        print(f"⚠️ 無法下載 Google 試算表，將使用舊有快取: {e}")
 
 def build_analysis(
     data_dir: Path,
@@ -344,16 +319,21 @@ def build_analysis(
     limit: int | None = None,
     assets_host: str = ASSETS_HOST,
     sleep_sec: float = 0.03,
-    auto_update_menu: bool = False,
 ) -> dict[str, Any]:
-    if auto_update_menu:
-        update_master_cache(master_dir)
-        update_length_overrides_from_google(data_dir)
     musics, master_difficulties = load_master(master_dir)
     length_lookup = load_length_multipliers_with_ids(length_xlsx, length_overrides or default_length_overrides(data_dir))
     charts: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     cache_dir = sus_cache_dir(data_dir)
+    previous_charts: dict[tuple[int, str], dict[str, Any]] = {}
+    if not force_download:
+        previous_payload = load_analysis(data_dir)
+        if previous_payload:
+            for chart in previous_payload.get("charts", []):
+                try:
+                    previous_charts[(int(chart["music_id"]), str(chart["difficulty"]))] = chart
+                except (KeyError, TypeError, ValueError):
+                    continue
 
     wanted = [row for row in master_difficulties if difficulties is None or row["musicDifficulty"] in difficulties]
     known_keys = {(int(row["musicId"]), row["musicDifficulty"]) for row in wanted}
@@ -385,7 +365,21 @@ def build_analysis(
             continue
         difficulty_name = difficulty["musicDifficulty"]
         sus_file = cache_dir / f"{music_id:04d}_{difficulty_name}.sus"
-        print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}")
+        cached_chart = previous_charts.get((music_id, difficulty_name))
+        if cached_chart is not None:
+            reused_chart = dict(cached_chart)
+            length_multiplier, length_source = resolve_length_multiplier(music, difficulty_name, length_lookup)
+            reused_chart["title"] = music["title"]
+            reused_chart["level"] = int(difficulty["playLevel"])
+            reused_chart["official_combo"] = int(
+                difficulty.get("totalNoteCount") or reused_chart.get("official_combo") or 0
+            )
+            reused_chart["combo_match"] = reused_chart["official_combo"] == int(reused_chart.get("parsed_combo") or 0)
+            reused_chart["length_multiplier"] = length_multiplier
+            reused_chart["length_multiplier_source"] = length_source
+            charts.append(reused_chart)
+            print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}（沿用快取）")
+            continue
         try:
             downloaded = download_sus(
                 music_id,
