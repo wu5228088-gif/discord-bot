@@ -308,6 +308,44 @@ def analyze_chart(
     }
 
 
+def update_master_cache(master_dir: Path) -> bool:
+    print("正在從遠端更新 musics.json 與 musicDifficulties.json ...")
+    try:
+        master_dir.mkdir(parents=True, exist_ok=True)
+        base_url = "https://sekai-world.github.io/sekai-master-db-diff"
+
+        musics_response = requests.get(f"{base_url}/musics.json", timeout=15)
+        musics_response.raise_for_status()
+        (master_dir / "musics.json").write_text(musics_response.text, encoding="utf-8")
+
+        difficulties_response = requests.get(f"{base_url}/musicDifficulties.json", timeout=15)
+        difficulties_response.raise_for_status()
+        (master_dir / "musicDifficulties.json").write_text(difficulties_response.text, encoding="utf-8")
+
+        print("歌曲菜單更新成功。")
+        return True
+    except Exception as exc:
+        print(f"更新歌曲菜單失敗: {exc}")
+        return False
+
+
+def update_length_overrides_from_google(data_dir: Path) -> None:
+    google_csv_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrxLZNUjy8RctfuipN89XyM6VXsANmkDgKOVrOZeC7fdBsPDL4_pHBpDW7yvdrUI4W09XmUAApbgpC/pub?output=csv"
+
+    print("正在從 Google 試算表下載最新的長度倍率...")
+    try:
+        response = requests.get(google_csv_url, timeout=10)
+        response.raise_for_status()
+        response.encoding = "utf-8"
+
+        data_dir.mkdir(parents=True, exist_ok=True)
+        target_path = data_dir / "pjsk_length_overrides.csv"
+        target_path.write_text(response.text, encoding="utf-8-sig")
+        print("長度倍率表更新成功。")
+    except Exception as exc:
+        print(f"無法下載 Google 試算表，將使用舊有快取: {exc}")
+
+
 def build_analysis(
     data_dir: Path,
     *,
@@ -319,7 +357,12 @@ def build_analysis(
     limit: int | None = None,
     assets_host: str = ASSETS_HOST,
     sleep_sec: float = 0.03,
+    auto_update_menu: bool = False,
 ) -> dict[str, Any]:
+    if auto_update_menu:
+        update_master_cache(master_dir)
+        update_length_overrides_from_google(data_dir)
+
     musics, master_difficulties = load_master(master_dir)
     length_lookup = load_length_multipliers_with_ids(length_xlsx, length_overrides or default_length_overrides(data_dir))
     charts: list[dict[str, Any]] = []
