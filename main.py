@@ -1030,6 +1030,11 @@ async def ensure_pjsk_score_cache_on_startup() -> None:
     cache_file = pjsk_score_cache_path(DATA_DIR)
     if cache_file.exists():
         log.info("PJSK score cache already exists; startup full analysis skipped: %s", cache_file)
+        if not pjsk_score_song_index_path().exists():
+            analysis = load_pjsk_score_analysis(DATA_DIR)
+            if analysis:
+                write_pjsk_score_song_index_from_analysis(analysis)
+                log.info("PJSK song autocomplete index rebuilt from existing score cache.")
         return
 
     log.info("PJSK score cache is missing; building full SUS analysis cache on startup.")
@@ -1620,6 +1625,66 @@ async def suite_profile_image_command(ctx: commands.Context) -> None:
     await ctx.send(file=discord.File(path, filename=path.name))
 
 
+PJSK_SCORE_SONG_INDEX_CACHE: list[dict[str, Any]] = []
+PJSK_SCORE_SONG_INDEX_MTIME: float | None = None
+
+
+def pjsk_score_song_index_path() -> Path:
+    return DATA_DIR / "pjsk_score_song_index.json"
+
+
+def load_pjsk_score_song_index() -> list[dict[str, Any]]:
+    global PJSK_SCORE_SONG_INDEX_CACHE, PJSK_SCORE_SONG_INDEX_MTIME
+    path = pjsk_score_song_index_path()
+    if not path.exists():
+        PJSK_SCORE_SONG_INDEX_CACHE = []
+        PJSK_SCORE_SONG_INDEX_MTIME = None
+        return []
+
+    mtime = path.stat().st_mtime
+    if PJSK_SCORE_SONG_INDEX_MTIME == mtime:
+        return PJSK_SCORE_SONG_INDEX_CACHE
+
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("PJSK song index load failed: %s", path)
+        PJSK_SCORE_SONG_INDEX_CACHE = []
+        PJSK_SCORE_SONG_INDEX_MTIME = None
+        return []
+
+    PJSK_SCORE_SONG_INDEX_CACHE = rows if isinstance(rows, list) else []
+    PJSK_SCORE_SONG_INDEX_MTIME = mtime
+    return PJSK_SCORE_SONG_INDEX_CACHE
+
+
+def write_pjsk_score_song_index_from_analysis(analysis: dict[str, Any]) -> None:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for chart in analysis.get("charts", []):
+        try:
+            music_id = int(chart["music_id"])
+            difficulty = str(chart["difficulty"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (music_id, difficulty)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "music_id": music_id,
+                "title": str(chart.get("title") or ""),
+                "difficulty": difficulty,
+                "level": int(chart.get("level") or 0),
+            }
+        )
+    rows.sort(key=lambda row: (row["music_id"], row["difficulty"]))
+    path = pjsk_score_song_index_path()
+    path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    load_pjsk_score_song_index()
+
+
 def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
     return load_pjsk_score_analysis(DATA_DIR)
 
@@ -2025,23 +2090,25 @@ async def pjsk_chart_song_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ) -> List[app_commands.Choice[str]]:
-    analysis = load_pjsk_score_cache_or_none()
-    if not analysis:
+    rows = load_pjsk_score_song_index()
+    if not rows:
         return []
     difficulty = getattr(interaction.namespace, "difficulty", None)
     current_norm = (current or "").lower()
     seen: set[int] = set()
     choices: list[app_commands.Choice[str]] = []
-    for chart in analysis.get("charts", []):
-        if difficulty and chart["difficulty"] != difficulty:
+    for row in rows:
+        row_difficulty = str(row.get("difficulty") or "")
+        if difficulty and row_difficulty != difficulty:
             continue
-        title = chart["title"]
-        if current_norm and current_norm not in title.lower() and current_norm not in str(chart["music_id"]):
+        title = str(row.get("title") or "")
+        music_id = int(row.get("music_id") or 0)
+        if current_norm and current_norm not in title.lower() and current_norm not in str(music_id):
             continue
-        if chart["music_id"] in seen:
+        if music_id in seen:
             continue
-        seen.add(chart["music_id"])
-        label = f"{chart['music_id']:04d} {title}"
+        seen.add(music_id)
+        label = f"{music_id:04d} {title}"
         choices.append(app_commands.Choice(name=label[:100], value=title[:100]))
         if len(choices) >= 25:
             break
