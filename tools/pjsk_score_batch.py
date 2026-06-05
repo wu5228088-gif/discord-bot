@@ -50,6 +50,10 @@ def csv_path(data_dir: Path) -> Path:
     return data_dir / "reports" / "pjsk_score_ranking.csv"
 
 
+def song_index_path(data_dir: Path) -> Path:
+    return data_dir / "pjsk_score_song_index.json"
+
+
 def sus_cache_dir(data_dir: Path) -> Path:
     return data_dir / "cache" / "pjsk_sus"
 
@@ -368,6 +372,9 @@ def build_analysis(
     charts: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     cache_dir = sus_cache_dir(data_dir)
+    reused_count = 0
+    analyzed_count = 0
+    downloaded_count = 0
     previous_charts: dict[tuple[int, str], dict[str, Any]] = {}
     if not force_download:
         previous_payload = load_analysis(data_dir)
@@ -421,8 +428,10 @@ def build_analysis(
             reused_chart["length_multiplier"] = length_multiplier
             reused_chart["length_multiplier_source"] = length_source
             charts.append(reused_chart)
-            print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}（沿用快取）")
+            reused_count += 1
+            print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}（沿用快取）", flush=True)
             continue
+        print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}（下載/分析）", flush=True)
         try:
             downloaded = download_sus(
                 music_id,
@@ -431,9 +440,13 @@ def build_analysis(
                 force=force_download,
                 assets_host=assets_host,
             )
+            if downloaded:
+                downloaded_count += 1
+                print(f"已下載 SUS: ID {music_id:04d} - {difficulty_name}", flush=True)
             if downloaded and sleep_sec > 0:
                 time.sleep(sleep_sec)
             charts.append(analyze_chart(sus_file, difficulty, music, length_lookup))
+            analyzed_count += 1
         except Exception as exc:  # noqa: BLE001 - batch output should keep going and report per-chart failures.
             errors.append(
                 {
@@ -443,6 +456,7 @@ def build_analysis(
                     "error": str(exc),
                 }
             )
+            print(f"處理失敗: ID {music_id:04d} - {difficulty_name}: {exc}", flush=True)
 
     payload = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -457,7 +471,12 @@ def build_analysis(
     data_dir.mkdir(parents=True, exist_ok=True)
     cache_path(data_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     write_csv(payload, data_dir)
+    write_song_index(payload, data_dir)
     write_missing_length_template(payload, data_dir)
+    print(
+        f"PJSK 分析完成: reused={reused_count} analyzed={analyzed_count} downloaded={downloaded_count} errors={len(errors)}",
+        flush=True,
+    )
     return payload
 
 
@@ -673,6 +692,38 @@ def write_csv(analysis: dict[str, Any], data_dir: Path) -> Path:
                     "fever_coverage_pct": chart.get("fever", {}).get("coverage_pct"),
                 }
             )
+    return path
+
+
+def write_song_index(analysis: dict[str, Any], data_dir: Path) -> Path:
+    path = song_index_path(data_dir)
+    rows = []
+    seen: set[tuple[int, str]] = set()
+    for chart in analysis.get("charts", []):
+        try:
+            music_id = int(chart["music_id"])
+            difficulty = str(chart["difficulty"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (music_id, difficulty)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "music_id": music_id,
+                "title": str(chart.get("title") or ""),
+                "difficulty": difficulty,
+                "level": int(chart.get("level") or 0),
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            row["music_id"],
+            DIFFICULTY_ORDER.index(row["difficulty"]) if row["difficulty"] in DIFFICULTY_ORDER else 99,
+        )
+    )
+    path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
     return path
 
 
