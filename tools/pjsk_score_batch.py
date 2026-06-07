@@ -362,6 +362,7 @@ def build_analysis(
     assets_host: str = ASSETS_HOST,
     sleep_sec: float = 0.03,
     auto_update_menu: bool = False,
+    checkpoint_interval: int = 100,
 ) -> dict[str, Any]:
     if auto_update_menu:
         update_master_cache(master_dir)
@@ -408,6 +409,25 @@ def build_analysis(
     if limit:
         wanted = wanted[:limit]
 
+    def make_payload(*, complete: bool) -> dict[str, Any]:
+        return {
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "assets_host": assets_host,
+            "length_xlsx": str(length_xlsx or default_length_xlsx()),
+            "length_overrides": str(length_overrides or default_length_overrides(data_dir)),
+            "chart_count": len(charts),
+            "error_count": len(errors),
+            "complete": complete,
+            "charts": charts,
+            "errors": errors,
+        }
+
+    def write_checkpoint() -> None:
+        payload = make_payload(complete=False)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        cache_path(data_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_song_index(payload, data_dir)
+
     for index, difficulty in enumerate(wanted, start=1):
         music_id = int(difficulty["musicId"])
         music = musics.get(music_id)
@@ -430,6 +450,8 @@ def build_analysis(
             charts.append(reused_chart)
             reused_count += 1
             print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}（沿用快取）", flush=True)
+            if checkpoint_interval > 0 and len(charts) % checkpoint_interval == 0:
+                write_checkpoint()
             continue
         print(f"正在處理 [{index}/{len(wanted)}]: ID {music_id:04d} - {difficulty_name}（下載/分析）", flush=True)
         try:
@@ -447,6 +469,8 @@ def build_analysis(
                 time.sleep(sleep_sec)
             charts.append(analyze_chart(sus_file, difficulty, music, length_lookup))
             analyzed_count += 1
+            if checkpoint_interval > 0 and len(charts) % checkpoint_interval == 0:
+                write_checkpoint()
         except Exception as exc:  # noqa: BLE001 - batch output should keep going and report per-chart failures.
             errors.append(
                 {
@@ -457,17 +481,10 @@ def build_analysis(
                 }
             )
             print(f"處理失敗: ID {music_id:04d} - {difficulty_name}: {exc}", flush=True)
+            if checkpoint_interval > 0 and (len(charts) + len(errors)) % checkpoint_interval == 0:
+                write_checkpoint()
 
-    payload = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "assets_host": assets_host,
-        "length_xlsx": str(length_xlsx or default_length_xlsx()),
-        "length_overrides": str(length_overrides or default_length_overrides(data_dir)),
-        "chart_count": len(charts),
-        "error_count": len(errors),
-        "charts": charts,
-        "errors": errors,
-    }
+    payload = make_payload(complete=True)
     data_dir.mkdir(parents=True, exist_ok=True)
     cache_path(data_dir).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     write_csv(payload, data_dir)
