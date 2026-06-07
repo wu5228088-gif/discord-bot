@@ -36,6 +36,7 @@ from tools.analyze_pjsk_snapshot import (
 )
 from tools.pjsk_score_batch import (
     BONUS_MULTIPLIERS,
+    DIFFICULTY_ORDER,
     build_analysis as build_pjsk_score_analysis,
     calculate_event_points,
     cache_path as pjsk_score_cache_path,
@@ -1053,6 +1054,7 @@ bot = commands.Bot(
 )
 bot.remove_command("help")
 bot.synced_commands_once = False
+PJSK_SCORE_UPDATE_LOCK = asyncio.Lock()
 
 
 @tasks.loop(minutes=1)
@@ -1072,12 +1074,57 @@ async def before_tracker() -> None:
     await bot.wait_until_ready()
 
 
+async def run_pjsk_score_update(
+    *,
+    reason: str,
+    force_download: bool = False,
+    difficulties: set[str] | None = None,
+    limit: Optional[int] = None,
+    auto_update_menu: bool = True,
+) -> dict[str, Any]:
+    if PJSK_SCORE_UPDATE_LOCK.locked():
+        log.info("PJSK score update skipped because another update is running: %s", reason)
+        existing = load_pjsk_score_analysis(DATA_DIR)
+        return existing if existing else {"charts": [], "errors": [], "chart_count": 0, "error_count": 0}
+
+    async with PJSK_SCORE_UPDATE_LOCK:
+        log.info("PJSK score update started: %s", reason)
+        payload = await asyncio.to_thread(
+            build_pjsk_score_analysis,
+            DATA_DIR,
+            master_dir=pjsk_default_master_dir(),
+            force_download=force_download,
+            difficulties=difficulties,
+            limit=limit,
+            auto_update_menu=auto_update_menu,
+        )
+        if not pjsk_score_song_index_path().exists():
+            write_pjsk_score_song_index_from_analysis(payload)
+        load_pjsk_score_song_index()
+        log.info(
+            "PJSK score update finished: %s charts=%s errors=%s",
+            reason,
+            payload.get("chart_count"),
+            payload.get("error_count"),
+        )
+        return payload
+
+
 async def ensure_pjsk_score_cache_on_startup() -> None:
     cache_file = pjsk_score_cache_path(DATA_DIR)
     if cache_file.exists():
+        analysis = load_pjsk_score_analysis(DATA_DIR)
+        cache_complete = bool(analysis.get("complete", True)) if analysis else False
+        if not cache_complete:
+            log.info("PJSK score cache is partial; startup will resume SUS analysis: %s", cache_file)
+            try:
+                await run_pjsk_score_update(reason="startup-resume", force_download=False, auto_update_menu=True)
+            except Exception:
+                log.exception("PJSK startup SUS analysis resume failed")
+            return
+
         log.info("PJSK score cache already exists; startup full analysis skipped: %s", cache_file)
         if not pjsk_score_song_index_path().exists():
-            analysis = load_pjsk_score_analysis(DATA_DIR)
             if analysis:
                 write_pjsk_score_song_index_from_analysis(analysis)
                 log.info("PJSK song autocomplete index rebuilt from existing score cache.")
@@ -1085,13 +1132,7 @@ async def ensure_pjsk_score_cache_on_startup() -> None:
 
     log.info("PJSK score cache is missing; building full SUS analysis cache on startup.")
     try:
-        await asyncio.to_thread(
-            build_pjsk_score_analysis,
-            DATA_DIR,
-            master_dir=pjsk_default_master_dir(),
-            force_download=False,
-            auto_update_menu=True,
-        )
+        await run_pjsk_score_update(reason="startup-initial", force_download=False, auto_update_menu=True)
         global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
         PJSK_SCORE_ANALYSIS_CACHE = load_pjsk_score_analysis(DATA_DIR)
         PJSK_SCORE_ANALYSIS_CACHE_MTIME = cache_file.stat().st_mtime if cache_file.exists() else None
@@ -1872,13 +1913,12 @@ async def pjsk_update_scores_command(
 ) -> None:
     await ctx.defer()
     selected = None if difficulty == "all" else {difficulty}
-    payload = await asyncio.to_thread(
-        build_pjsk_score_analysis,
-        DATA_DIR,
-        master_dir=pjsk_default_master_dir(),
+    payload = await run_pjsk_score_update(
+        reason="discord-command",
         force_download=force_download,
         difficulties=selected,
         limit=limit,
+        auto_update_menu=True,
     )
     cache_file = pjsk_score_cache_path(DATA_DIR)
     length_file = pjsk_length_overrides_path(DATA_DIR)
@@ -2131,6 +2171,139 @@ async def pjsk_chart_command(
     await ctx.send(embed=embed)
 
 
+def normalize_song_query(value: str) -> str:
+    return "".join(str(value).split()).lower()
+
+
+def find_pjsk_score_charts_for_song(analysis: dict[str, Any], query: str) -> list[dict[str, Any]]:
+    query_norm = normalize_song_query(query)
+    exact_matches = [
+        chart
+        for chart in analysis.get("charts", [])
+        if str(chart.get("music_id")) == str(query) or normalize_song_query(chart.get("title", "")) == query_norm
+    ]
+    if exact_matches:
+        music_id = exact_matches[0]["music_id"]
+        matches = [chart for chart in analysis.get("charts", []) if chart.get("music_id") == music_id]
+    else:
+        partial_matches = [
+            chart
+            for chart in analysis.get("charts", [])
+            if query_norm and query_norm in normalize_song_query(chart.get("title", ""))
+        ]
+        if not partial_matches:
+            return []
+        music_id = partial_matches[0]["music_id"]
+        matches = [chart for chart in analysis.get("charts", []) if chart.get("music_id") == music_id]
+
+    return sorted(
+        matches,
+        key=lambda chart: (
+            DIFFICULTY_ORDER.index(chart["difficulty"]) if chart.get("difficulty") in DIFFICULTY_ORDER else 99,
+            chart.get("level", 0),
+        ),
+    )
+
+
+@bot.hybrid_command(name="pjskchartall", description="查詢單曲所有難度的理論分數與預測活動pt")
+@app_commands.describe(
+    song="曲名或歌曲 ID，可輸入關鍵字",
+    power="綜合力；不填則只顯示分數倍率",
+    event_multiplier="活動倍率，預設 1",
+    bonus="bonus 消耗，預設 5 火",
+    score_mode="分數模式，多人套 fever 與活躍分，單人不套",
+    skill_mode="技能倍率輸入方式",
+    skill_multiplier="單一技能倍率，預設 3.7",
+    skill1="第 1 段技能倍率，skill_mode=6段分別輸入時使用",
+    skill2="第 2 段技能倍率",
+    skill3="第 3 段技能倍率",
+    skill4="第 4 段技能倍率",
+    skill5="第 5 段技能倍率",
+    skill6="第 6 段技能倍率",
+)
+@app_commands.choices(
+    bonus=BONUS_CHOICES,
+    skill_mode=PJSK_SKILL_MODE_CHOICES,
+    score_mode=PJSK_SCORE_MODE_CHOICES,
+)
+async def pjsk_chart_all_command(
+    ctx: commands.Context,
+    song: str,
+    power: Optional[int] = None,
+    event_multiplier: float = 1.0,
+    bonus: int = 5,
+    score_mode: str = "multi",
+    skill_mode: str = "single",
+    skill_multiplier: Optional[float] = None,
+    skill1: Optional[float] = None,
+    skill2: Optional[float] = None,
+    skill3: Optional[float] = None,
+    skill4: Optional[float] = None,
+    skill5: Optional[float] = None,
+    skill6: Optional[float] = None,
+) -> None:
+    analysis = load_pjsk_score_cache_or_none()
+    if not analysis:
+        await ctx.send("還沒有分析快取，請先跑 `/pjskupdatescores`。")
+        return
+
+    charts = find_pjsk_score_charts_for_song(analysis, song)
+    if not charts:
+        await ctx.send("找不到這首歌；可以用歌曲 ID 或更完整的曲名試一次。")
+        return
+
+    skill_multipliers = resolve_skill_multipliers(
+        skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
+    )
+    active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
+    use_fever = score_mode == "multi"
+    dummy_power = power if power is not None else 1
+    lines = []
+    for chart in charts:
+        calc = calculate_event_points(
+            chart,
+            dummy_power,
+            event_multiplier,
+            bonus,
+            skill_multipliers,
+            active_bonus,
+            use_fever,
+        )
+        prefix = f"**{chart['difficulty'].upper()}** Lv.{chart['level']}｜"
+        if power is not None:
+            score_text = format_number_range(
+                float(calc.get("score_min", calc["score"])),
+                float(calc.get("score_max", calc["score"])),
+                digits=0,
+            )
+            pt_text = format_number_range(
+                float(calc.get("event_pt_min", calc["event_pt"])),
+                float(calc.get("event_pt_max", calc["event_pt"])),
+                digits=0,
+            )
+            length_note = "｜缺長度倍率" if calc.get("length_missing") else ""
+            lines.append(f"{prefix}理論分數 `{score_text}`｜預測pt `{pt_text}`{length_note}")
+        else:
+            score_multiplier_text = format_number_range(
+                float(calc.get("score_power_multiplier_min", calc["score_power_multiplier"])),
+                float(calc.get("score_power_multiplier_max", calc["score_power_multiplier"])),
+                digits=4,
+                suffix="x",
+            )
+            lines.append(f"{prefix}理論分數 `{score_multiplier_text} 綜合力`")
+
+    mode_text = "多人/協力" if score_mode == "multi" else "單人/挑戰"
+    power_text = f"{power:,}" if power is not None else "未填"
+    embed = discord.Embed(
+        title=f"{charts[0]['title']}｜全難度",
+        description="\n".join(lines),
+        color=EMBED_COLOR,
+    )
+    embed.add_field(name="設定", value=f"{mode_text}｜綜合力 {power_text}｜活動倍率 {event_multiplier:g}｜{bonus}火", inline=False)
+    embed.add_field(name="技能倍率", value="/".join(f"x{value:g}" for value in skill_multipliers), inline=False)
+    await ctx.send(embed=embed)
+
+
 @pjsk_chart_command.autocomplete("song")
 async def pjsk_chart_song_autocomplete(
     interaction: discord.Interaction,
@@ -2161,6 +2334,14 @@ async def pjsk_chart_song_autocomplete(
     return choices
 
 
+@pjsk_chart_all_command.autocomplete("song")
+async def pjsk_chart_all_song_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    return await pjsk_chart_song_autocomplete(interaction, current)
+
+
 @bot.hybrid_command(name="help", description="顯示指令列表")
 async def help_command(ctx: commands.Context) -> None:
     embed = discord.Embed(
@@ -2180,6 +2361,7 @@ async def help_command(ctx: commands.Context) -> None:
             "`/pjskupdatescores` 下載並分析 SUS 分數資料\n"
             "`/pjskrank` 查技能覆蓋/理論分數/活動pt排行\n"
             "`/pjskchart song difficulty` 查單曲分數細節，綜合力可留空\n"
+            "`/pjskchartall song` 查單曲全難度分數，綜合力可留空\n"
             "`/pjsklengthfile` 取得可手動補長度倍率的 CSV"
         ),
         color=EMBED_COLOR,
@@ -2256,3 +2438,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
