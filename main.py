@@ -63,6 +63,8 @@ GRAPH_TICK_SIZE = 12
 GRAPH_LINE_COLOR = "#55BFA3"
 GRAPH_FONT_WEIGHT = "black"
 GRAPH_FONT_FILE = BASE_DIR / "NotoSansTC-Bold.ttf"
+MAX_EVENT_HISTORY_SNAPSHOTS = int(os.getenv("MAX_EVENT_HISTORY_SNAPSHOTS", "4320"))
+MAX_GRAPH_POINTS = int(os.getenv("MAX_GRAPH_POINTS", "1200"))
 
 TOP100_URL = os.getenv(
     "HISEKAI_TOP100_URL",
@@ -649,6 +651,46 @@ def append_snapshot_if_changed(
     return True
 
 
+def prune_timeline(timeline: Any, limit: int = MAX_EVENT_HISTORY_SNAPSHOTS) -> List[Dict[str, Any]]:
+    if not isinstance(timeline, list):
+        return []
+    if limit <= 0 or len(timeline) <= limit:
+        return timeline
+    return timeline[-limit:]
+
+
+def prune_event_storage(storage: Dict[str, Any]) -> None:
+    storage["total"] = prune_timeline(storage.get("total"))
+    chapters = storage.get("chapters")
+    if not isinstance(chapters, dict):
+        storage["chapters"] = {}
+        return
+    for key, timeline in list(chapters.items()):
+        chapters[key] = prune_timeline(timeline)
+
+
+def downsample_history_points(
+    points: List[Tuple[datetime, Optional[int]]],
+    max_points: int = MAX_GRAPH_POINTS,
+) -> List[Tuple[datetime, Optional[int]]]:
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+    if max_points <= 2:
+        return points[-max_points:]
+
+    last_index = len(points) - 1
+    step = last_index / (max_points - 1)
+    selected = []
+    used_indexes: set[int] = set()
+    for index in range(max_points):
+        source_index = min(last_index, round(index * step))
+        if source_index in used_indexes:
+            continue
+        used_indexes.add(source_index)
+        selected.append(points[source_index])
+    return selected
+
+
 def record_rankings(data: Dict[str, Any], storage: Dict[str, Any]) -> bool:
     captured_at = now_tw().isoformat(timespec="minutes")
     changed = False
@@ -675,6 +717,7 @@ def record_rankings(data: Dict[str, Any], storage: Dict[str, Any]) -> bool:
                 captured_at,
             )
 
+    prune_event_storage(storage)
     return changed
 
 
@@ -867,6 +910,7 @@ def history_for_rank(
 
 def plot_history(points: List[Tuple[datetime, Optional[int]]], title: str, start_at: datetime) -> io.BytesIO:
     setup_matplotlib_font()
+    points = downsample_history_points(points)
 
     plot_points = [(time, score) for time, score in points if score is not None]
     fig, ax = plt.subplots(figsize=(10, 6), dpi=140)
@@ -990,7 +1034,9 @@ def save_bound_ids(data: Dict[str, Dict[str, str]]) -> None:
 
 
 def load_event_storage(top_data: Dict[str, Any]) -> Dict[str, Any]:
-    return normalize_storage(load_json(DATA_FILE, {}), top_data)
+    storage = normalize_storage(load_json(DATA_FILE, {}), top_data)
+    prune_event_storage(storage)
+    return storage
 
 
 load_env_file()
