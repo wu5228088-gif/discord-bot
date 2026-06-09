@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,7 +58,9 @@ UPLOAD_REPORT_DIR = DATA_DIR / "reports" / "uploads"
 ANALYSIS_STATE_FILE = DATA_DIR / "analysis_state.json"
 
 TW = timezone(timedelta(hours=8))
-REQUEST_TIMEOUT = 15
+REQUEST_CONNECT_TIMEOUT = float(os.getenv("REQUEST_CONNECT_TIMEOUT", "5"))
+REQUEST_READ_TIMEOUT = float(os.getenv("REQUEST_READ_TIMEOUT", "10"))
+REQUEST_TIMEOUT = (REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT)
 EMBED_COLOR = 0x6BFF3D
 GRAPH_TITLE_SIZE = 20
 GRAPH_TICK_SIZE = 12
@@ -369,13 +372,42 @@ async def send_query_embed(ctx: commands.Context, title: str, lines: Iterable[st
     await ctx.send(embed=embed)
 
 
+async def safe_ctx_send(ctx: commands.Context, *args: Any, **kwargs: Any) -> bool:
+    try:
+        interaction = getattr(ctx, "interaction", None)
+        if interaction is not None and interaction.response.is_done():
+            await interaction.followup.send(*args, **kwargs)
+        else:
+            await ctx.send(*args, **kwargs)
+        return True
+    except discord.NotFound:
+        log.warning("Discord interaction expired before the bot could respond.")
+        return False
+    except discord.HTTPException:
+        log.exception("Discord response send failed")
+        return False
+
+
 def fetch_json(url: str) -> Dict[str, Any]:
-    response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        raise ValueError(f"API 回傳格式不是 object: {url}")
-    return data
+    last_error: Exception | None = None
+    headers = {"User-Agent": "hisekai-discord-bot/2.0"}
+    for attempt in range(2):
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError(f"API 回傳格式不是 object: {url}")
+            return data
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            raise
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"無法取得 API 資料: {url}")
 
 
 async def fetch_top_data() -> Dict[str, Any]:
@@ -1055,16 +1087,25 @@ bot = commands.Bot(
 bot.remove_command("help")
 bot.synced_commands_once = False
 PJSK_SCORE_UPDATE_LOCK = asyncio.Lock()
+TRACKER_BACKOFF_UNTIL: datetime | None = None
 
 
 @tasks.loop(minutes=1)
 async def tracker() -> None:
+    global TRACKER_BACKOFF_UNTIL
+    if TRACKER_BACKOFF_UNTIL and datetime.now(timezone.utc) < TRACKER_BACKOFF_UNTIL:
+        return
+
     try:
         top_data = await fetch_top_data()
         storage = load_event_storage(top_data)
         changed = record_rankings(top_data, storage)
         if changed:
             save_json(DATA_FILE, storage)
+        TRACKER_BACKOFF_UNTIL = None
+    except requests.exceptions.RequestException as exc:
+        TRACKER_BACKOFF_UNTIL = datetime.now(timezone.utc) + timedelta(minutes=5)
+        log.warning("背景追蹤 API 暫時失敗，5 分鐘後重試: %s", exc)
     except Exception:
         log.exception("背景追蹤更新失敗")
 
@@ -1167,15 +1208,15 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         return
 
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"缺少參數：`{error.param.name}`，請使用 `/help` 查看用法。")
+        await safe_ctx_send(ctx, f"缺少參數：`{error.param.name}`，請使用 `/help` 查看用法。")
         return
 
     if isinstance(error, commands.BadArgument):
-        await ctx.send("參數格式錯誤，請確認 rank 是數字。")
+        await safe_ctx_send(ctx, "參數格式錯誤，請確認 rank 是數字。")
         return
 
     log.exception("Command error: %s", error)
-    await ctx.send("指令執行時發生錯誤，請稍後再試。")
+    await safe_ctx_send(ctx, "指令執行時發生錯誤，請稍後再試。")
 
 
 @bot.hybrid_command(name="bind", description="綁定你的遊戲玩家 ID")
