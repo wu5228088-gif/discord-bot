@@ -366,10 +366,10 @@ def sendable_lines(lines: Iterable[str], limit: int = 3600) -> str:
 async def send_query_embed(ctx: commands.Context, title: str, lines: Iterable[str], empty: str) -> None:
     body = sendable_lines(lines)
     if not body:
-        await ctx.send(empty)
+        await safe_ctx_send(ctx, empty)
         return
     embed = discord.Embed(title=title, description=body, color=EMBED_COLOR)
-    await ctx.send(embed=embed)
+    await safe_ctx_send(ctx, embed=embed)
 
 
 async def safe_ctx_send(ctx: commands.Context, *args: Any, **kwargs: Any) -> bool:
@@ -385,6 +385,18 @@ async def safe_ctx_send(ctx: commands.Context, *args: Any, **kwargs: Any) -> boo
         return False
     except discord.HTTPException:
         log.exception("Discord response send failed")
+        return False
+
+
+async def safe_ctx_defer(ctx: commands.Context) -> bool:
+    try:
+        await ctx.defer()
+        return True
+    except discord.NotFound:
+        log.warning("Discord interaction expired before the bot could be deferred.")
+        return False
+    except discord.HTTPException:
+        log.exception("Discord response defer failed")
         return False
 
 
@@ -1205,6 +1217,11 @@ async def on_ready() -> None:
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.CommandNotFound):
+        return
+
+    original = getattr(error, "original", None)
+    if isinstance(original, discord.NotFound):
+        log.warning("Discord interaction expired before the bot could respond.")
         return
 
     if isinstance(error, commands.MissingRequiredArgument):
@@ -2031,12 +2048,15 @@ async def pjsk_rank_command(
     end_rank: int = 10,
     sort_by: str = "event_pt",
 ) -> None:
+    if not await safe_ctx_defer(ctx):
+        return
+
     analysis = load_pjsk_score_cache_or_none()
     if not analysis:
-        await ctx.send("還沒有分析快取，請先跑 `/pjskupdatescores`。")
+        await safe_ctx_send(ctx, "還沒有分析快取，請先跑 `/pjskupdatescores`。")
         return
     if sort_by in {"event_pt", "score"} and power is None:
-        await ctx.send("依活動pt或理論分數排行需要填 `power`；若只想看覆蓋率，排序請選 `技能覆蓋率`。")
+        await safe_ctx_send(ctx, "依活動pt或理論分數排行需要填 `power`；若只想看覆蓋率，排序請選 `技能覆蓋率`。")
         return
     start_rank = max(1, start_rank)
     end_rank = max(start_rank, end_rank)
@@ -2073,9 +2093,9 @@ async def pjsk_rank_command(
             use_fever=use_fever,
             difficulty=difficulty,
             sort_by=sort_by,
-        )
+    )
     if not rows:
-        await ctx.send("沒有符合條件的譜面資料。")
+        await safe_ctx_send(ctx, "沒有符合條件的譜面資料。")
         return
     page = rows[start_rank - 1 : end_rank]
     skill_label = "技能 " + "/".join(f"{value:g}" for value in skill_multipliers)
@@ -2129,13 +2149,16 @@ async def pjsk_chart_command(
     skill5: Optional[float] = None,
     skill6: Optional[float] = None,
 ) -> None:
+    if not await safe_ctx_defer(ctx):
+        return
+
     analysis = load_pjsk_score_cache_or_none()
     if not analysis:
-        await ctx.send("還沒有分析快取，請先跑 `/pjskupdatescores`。")
+        await safe_ctx_send(ctx, "還沒有分析快取，請先跑 `/pjskupdatescores`。")
         return
     chart = find_pjsk_score_chart(analysis, song, difficulty)
     if not chart:
-        await ctx.send("找不到這首歌/難度；可以用歌曲 ID 或更完整的曲名試一次。")
+        await safe_ctx_send(ctx, "找不到這首歌/難度；可以用歌曲 ID 或更完整的曲名試一次。")
         return
     skill_multipliers = resolve_skill_multipliers(
         skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
@@ -2209,7 +2232,7 @@ async def pjsk_chart_command(
             ),
             inline=False,
         )
-    await ctx.send(embed=embed)
+    await safe_ctx_send(ctx, embed=embed)
 
 
 def normalize_song_query(value: str) -> str:
@@ -2283,14 +2306,17 @@ async def pjsk_chart_all_command(
     skill5: Optional[float] = None,
     skill6: Optional[float] = None,
 ) -> None:
+    if not await safe_ctx_defer(ctx):
+        return
+
     analysis = load_pjsk_score_cache_or_none()
     if not analysis:
-        await ctx.send("還沒有分析快取，請先跑 `/pjskupdatescores`。")
+        await safe_ctx_send(ctx, "還沒有分析快取，請先跑 `/pjskupdatescores`。")
         return
 
     charts = find_pjsk_score_charts_for_song(analysis, song)
     if not charts:
-        await ctx.send("找不到這首歌；可以用歌曲 ID 或更完整的曲名試一次。")
+        await safe_ctx_send(ctx, "找不到這首歌；可以用歌曲 ID 或更完整的曲名試一次。")
         return
 
     skill_multipliers = resolve_skill_multipliers(
@@ -2342,7 +2368,7 @@ async def pjsk_chart_all_command(
     )
     embed.add_field(name="設定", value=f"{mode_text}｜綜合力 {power_text}｜活動倍率 {event_multiplier:g}｜{bonus}火", inline=False)
     embed.add_field(name="技能倍率", value="/".join(f"x{value:g}" for value in skill_multipliers), inline=False)
-    await ctx.send(embed=embed)
+    await safe_ctx_send(ctx, embed=embed)
 
 
 @pjsk_chart_command.autocomplete("song")
