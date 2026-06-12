@@ -1137,7 +1137,7 @@ async def run_pjsk_score_update(
 ) -> dict[str, Any]:
     if PJSK_SCORE_UPDATE_LOCK.locked():
         log.info("PJSK score update skipped because another update is running: %s", reason)
-        existing = load_pjsk_score_analysis(DATA_DIR)
+        existing = await asyncio.to_thread(load_pjsk_score_analysis, DATA_DIR)
         return existing if existing else {"charts": [], "errors": [], "chart_count": 0, "error_count": 0}
 
     async with PJSK_SCORE_UPDATE_LOCK:
@@ -1152,8 +1152,8 @@ async def run_pjsk_score_update(
             auto_update_menu=auto_update_menu,
         )
         if not pjsk_score_song_index_path().exists():
-            write_pjsk_score_song_index_from_analysis(payload)
-        load_pjsk_score_song_index()
+            await asyncio.to_thread(write_pjsk_score_song_index_from_analysis, payload)
+        await asyncio.to_thread(load_pjsk_score_song_index)
         log.info(
             "PJSK score update finished: %s charts=%s errors=%s",
             reason,
@@ -1166,7 +1166,7 @@ async def run_pjsk_score_update(
 async def ensure_pjsk_score_cache_on_startup() -> None:
     cache_file = pjsk_score_cache_path(DATA_DIR)
     if cache_file.exists():
-        analysis = load_pjsk_score_analysis(DATA_DIR)
+        analysis = await asyncio.to_thread(load_pjsk_score_analysis, DATA_DIR)
         cache_complete = bool(analysis.get("complete", True)) if analysis else False
         if not cache_complete:
             log.info("PJSK score cache is partial; startup will resume SUS analysis: %s", cache_file)
@@ -1179,16 +1179,13 @@ async def ensure_pjsk_score_cache_on_startup() -> None:
         log.info("PJSK score cache already exists; startup full analysis skipped: %s", cache_file)
         if not pjsk_score_song_index_path().exists():
             if analysis:
-                write_pjsk_score_song_index_from_analysis(analysis)
+                await asyncio.to_thread(write_pjsk_score_song_index_from_analysis, analysis)
                 log.info("PJSK song autocomplete index rebuilt from existing score cache.")
         return
 
     log.info("PJSK score cache is missing; building full SUS analysis cache on startup.")
     try:
         await run_pjsk_score_update(reason="startup-initial", force_download=False, auto_update_menu=True)
-        global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_CACHE_MTIME
-        PJSK_SCORE_ANALYSIS_CACHE = load_pjsk_score_analysis(DATA_DIR)
-        PJSK_SCORE_ANALYSIS_CACHE_MTIME = cache_file.stat().st_mtime if cache_file.exists() else None
         log.info("PJSK startup SUS analysis cache build finished.")
     except Exception:
         log.exception("PJSK startup SUS analysis cache build failed")
@@ -1834,6 +1831,10 @@ def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
     return load_pjsk_score_analysis(DATA_DIR)
 
 
+async def load_pjsk_score_cache_or_none_async() -> dict[str, Any] | None:
+    return await asyncio.to_thread(load_pjsk_score_cache_or_none)
+
+
 def resolve_skill_multipliers(
     mode: str = "single",
     skill_multiplier: float = 3.7,
@@ -2051,7 +2052,7 @@ async def pjsk_rank_command(
     if not await safe_ctx_defer(ctx):
         return
 
-    analysis = load_pjsk_score_cache_or_none()
+    analysis = await load_pjsk_score_cache_or_none_async()
     if not analysis:
         await safe_ctx_send(ctx, "還沒有分析快取，請先跑 `/pjskupdatescores`。")
         return
@@ -2152,7 +2153,7 @@ async def pjsk_chart_command(
     if not await safe_ctx_defer(ctx):
         return
 
-    analysis = load_pjsk_score_cache_or_none()
+    analysis = await load_pjsk_score_cache_or_none_async()
     if not analysis:
         await safe_ctx_send(ctx, "還沒有分析快取，請先跑 `/pjskupdatescores`。")
         return
@@ -2309,7 +2310,7 @@ async def pjsk_chart_all_command(
     if not await safe_ctx_defer(ctx):
         return
 
-    analysis = load_pjsk_score_cache_or_none()
+    analysis = await load_pjsk_score_cache_or_none_async()
     if not analysis:
         await safe_ctx_send(ctx, "還沒有分析快取，請先跑 `/pjskupdatescores`。")
         return
@@ -2463,7 +2464,10 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            log.debug("Health check client disconnected before response was written.")
 
     def log_message(self, format: str, *args: Any) -> None:
         log.debug("Health check: " + format, *args)
@@ -2476,6 +2480,7 @@ def start_render_health_server() -> None:
 
     try:
         server = ThreadingHTTPServer(("0.0.0.0", int(port)), HealthRequestHandler)
+        server.daemon_threads = True
     except ValueError as exc:
         raise RuntimeError(f"PORT 必須是數字，目前是: {port!r}") from exc
 
