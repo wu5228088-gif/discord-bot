@@ -21,6 +21,7 @@ DIFFICULTY_ORDER = ["easy", "normal", "hard", "expert", "master", "append"]
 ASSETS_HOST = "https://assets-direct.unipjsk.com"
 BONUS_MULTIPLIERS = {1: 5, 2: 10, 3: 15, 4: 20, 5: 25, 6: 27, 7: 29, 8: 31, 9: 33, 10: 35}
 NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+SUS_DOWNLOAD_HEADERS = {"User-Agent": "hisekai-pjsk-score-batch/1.0"}
 
 
 def default_length_xlsx() -> Path:
@@ -56,6 +57,40 @@ def song_index_path(data_dir: Path) -> Path:
 
 def sus_cache_dir(data_dir: Path) -> Path:
     return data_dir / "cache" / "pjsk_sus"
+
+
+def parse_assets_hosts(value: str | None) -> list[str]:
+    if not value:
+        return []
+    hosts = []
+    for raw in re.split(r"[\s,;]+", value):
+        host = raw.strip()
+        if host:
+            hosts.append(host)
+    return hosts
+
+
+def resolve_assets_hosts(
+    assets_host: str | None = None,
+    assets_hosts: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    resolved: list[str] = []
+    candidates: list[str] = []
+    if assets_hosts:
+        candidates.extend(str(host) for host in assets_hosts)
+    if assets_host:
+        candidates.append(str(assets_host))
+    candidates.extend(parse_assets_hosts(os.getenv("PJSK_ASSETS_HOSTS")))
+    env_host = os.getenv("PJSK_ASSETS_HOST")
+    if env_host:
+        candidates.append(env_host)
+    candidates.append(ASSETS_HOST)
+
+    for raw in candidates:
+        host = raw.strip().rstrip("/")
+        if host and host not in resolved:
+            resolved.append(host)
+    return resolved
 
 
 def col_to_index(ref: str) -> int:
@@ -205,19 +240,37 @@ def download_sus(
     target: Path,
     *,
     force: bool = False,
-    assets_host: str = ASSETS_HOST,
-    timeout: int = 30,
+    assets_host: str | None = ASSETS_HOST,
+    assets_hosts: list[str] | tuple[str, ...] | None = None,
+    timeout: int = 20,
+    retries: int = 2,
 ) -> bool:
     if target.exists() and not force:
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
-    response = requests.get(sus_url(music_id, difficulty, assets_host), timeout=timeout)
-    response.raise_for_status()
-    text = response.text
-    if "#" not in text[:1000]:
-        raise ValueError(f"Downloaded data does not look like SUS: {music_id:04d} {difficulty}")
-    target.write_text(text, encoding="utf-8")
-    return True
+
+    errors: list[str] = []
+    for host in resolve_assets_hosts(assets_host, assets_hosts):
+        url = sus_url(music_id, difficulty, host)
+        for attempt in range(1, max(1, retries) + 1):
+            try:
+                response = requests.get(url, timeout=timeout, headers=SUS_DOWNLOAD_HEADERS)
+                response.raise_for_status()
+                text = response.text
+                if "#" not in text[:1000]:
+                    raise ValueError(f"response does not look like SUS from {url}")
+                target.write_text(text, encoding="utf-8")
+                return True
+            except requests.exceptions.RequestException as exc:
+                errors.append(f"{url} attempt {attempt}/{max(1, retries)}: {exc}")
+                if attempt < max(1, retries):
+                    time.sleep(min(2.0, 0.4 * attempt))
+            except ValueError as exc:
+                errors.append(str(exc))
+                break
+
+    detail = " | ".join(errors) if errors else "no SUS asset hosts configured"
+    raise RuntimeError(f"All SUS download sources failed for {music_id:04d} {difficulty}: {detail}")
 
 
 def cached_sus_keys(cache_dir: Path) -> set[tuple[int, str]]:
@@ -359,7 +412,8 @@ def build_analysis(
     force_download: bool = False,
     difficulties: set[str] | None = None,
     limit: int | None = None,
-    assets_host: str = ASSETS_HOST,
+    assets_host: str | None = ASSETS_HOST,
+    assets_hosts: list[str] | tuple[str, ...] | None = None,
     sleep_sec: float = 0.03,
     auto_update_menu: bool = False,
     checkpoint_interval: int = 100,
@@ -373,6 +427,7 @@ def build_analysis(
     charts: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     cache_dir = sus_cache_dir(data_dir)
+    resolved_assets_hosts = resolve_assets_hosts(assets_host, assets_hosts)
     reused_count = 0
     analyzed_count = 0
     downloaded_count = 0
@@ -412,7 +467,8 @@ def build_analysis(
     def make_payload(*, complete: bool) -> dict[str, Any]:
         return {
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "assets_host": assets_host,
+            "assets_host": resolved_assets_hosts[0] if resolved_assets_hosts else "",
+            "assets_hosts": resolved_assets_hosts,
             "length_xlsx": str(length_xlsx or default_length_xlsx()),
             "length_overrides": str(length_overrides or default_length_overrides(data_dir)),
             "chart_count": len(charts),
@@ -460,7 +516,7 @@ def build_analysis(
                 difficulty_name,
                 sus_file,
                 force=force_download,
-                assets_host=assets_host,
+                assets_hosts=resolved_assets_hosts,
             )
             if downloaded:
                 downloaded_count += 1
@@ -810,6 +866,12 @@ def main() -> None:
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--difficulty", choices=["all", *DIFFICULTY_ORDER], default="all")
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--assets-host",
+        action="append",
+        dest="assets_hosts",
+        help="SUS asset host. Can be passed more than once. PJSK_ASSETS_HOSTS also works.",
+    )
     args = parser.parse_args()
 
     difficulties = None if args.difficulty == "all" else {args.difficulty}
@@ -821,6 +883,7 @@ def main() -> None:
         force_download=args.force_download,
         difficulties=difficulties,
         limit=args.limit,
+        assets_hosts=args.assets_hosts,
     )
     print(f"analyzed={payload['chart_count']} errors={payload['error_count']}")
     print(cache_path(args.data_dir))
@@ -829,3 +892,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
