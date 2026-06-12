@@ -350,6 +350,13 @@ def clamp_count(value: int, *, default: int = 20, minimum: int = 1, maximum: int
     return max(minimum, min(maximum, count))
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def sendable_lines(lines: Iterable[str], limit: int = 3600) -> str:
     selected: List[str] = []
     used = 0
@@ -1165,10 +1172,17 @@ async def run_pjsk_score_update(
 
 async def ensure_pjsk_score_cache_on_startup() -> None:
     cache_file = pjsk_score_cache_path(DATA_DIR)
+    startup_update_enabled = env_flag("PJSK_STARTUP_SCORE_UPDATE", False)
     if cache_file.exists():
         analysis = await asyncio.to_thread(load_pjsk_score_analysis, DATA_DIR)
         cache_complete = bool(analysis.get("complete", True)) if analysis else False
         if not cache_complete:
+            if not startup_update_enabled:
+                log.warning(
+                    "PJSK score cache is partial; startup auto-resume is disabled. "
+                    "Run /pjskupdatescores manually or set PJSK_STARTUP_SCORE_UPDATE=1 to resume on startup."
+                )
+                return
             log.info("PJSK score cache is partial; startup will resume SUS analysis: %s", cache_file)
             try:
                 await run_pjsk_score_update(reason="startup-resume", force_download=False, auto_update_menu=True)
@@ -1181,6 +1195,13 @@ async def ensure_pjsk_score_cache_on_startup() -> None:
             if analysis:
                 await asyncio.to_thread(write_pjsk_score_song_index_from_analysis, analysis)
                 log.info("PJSK song autocomplete index rebuilt from existing score cache.")
+        return
+
+    if not startup_update_enabled:
+        log.warning(
+            "PJSK score cache is missing; startup full SUS analysis is disabled. "
+            "Run /pjskupdatescores manually or set PJSK_STARTUP_SCORE_UPDATE=1 to build it on startup."
+        )
         return
 
     log.info("PJSK score cache is missing; building full SUS analysis cache on startup.")
@@ -2510,4 +2531,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
