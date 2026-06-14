@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from urllib.parse import urlsplit
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -2474,8 +2475,12 @@ for legacy_command in LEGACY_COMMANDS:
 
 
 class HealthRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if self.path not in ("/", "/healthz"):
+    def _health_path_ok(self) -> bool:
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        return path in ("/", "/healthz")
+
+    def _send_health(self, *, include_body: bool) -> None:
+        if not self._health_path_ok():
             self.send_response(404)
             self.end_headers()
             return
@@ -2483,12 +2488,20 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         payload = b"ok\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Content-Length", str(len(payload) if include_body else 0))
         self.end_headers()
+        if not include_body:
+            return
         try:
             self.wfile.write(payload)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             log.debug("Health check client disconnected before response was written.")
+
+    def do_GET(self) -> None:
+        self._send_health(include_body=True)
+
+    def do_HEAD(self) -> None:
+        self._send_health(include_body=False)
 
     def log_message(self, format: str, *args: Any) -> None:
         log.debug("Health check: " + format, *args)
