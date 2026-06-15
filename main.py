@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import gc
 import io
 import json
 import logging
@@ -19,16 +20,9 @@ from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import discord
-import matplotlib
 import requests
 from discord import app_commands
 from discord.ext import commands, tasks
-
-matplotlib.use("Agg")
-import matplotlib.dates as mdates
-import matplotlib.font_manager as fm
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 
 from tools.analyze_pjsk_snapshot import (
     build_mysekai_report,
@@ -191,6 +185,12 @@ def configure_data_paths() -> None:
 
 
 def setup_matplotlib_font() -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.font_manager as fm
+    import matplotlib.pyplot as plt
+
     if GRAPH_FONT_FILE.exists():
         fm.fontManager.addfont(str(GRAPH_FONT_FILE))
         font_name = fm.FontProperties(fname=str(GRAPH_FONT_FILE)).get_name()
@@ -962,6 +962,10 @@ def history_for_rank(
 
 
 def plot_history(points: List[Tuple[datetime, Optional[int]]], title: str, start_at: datetime) -> io.BytesIO:
+    import matplotlib.dates as mdates
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
     setup_matplotlib_font()
     points = downsample_history_points(points)
 
@@ -1017,6 +1021,7 @@ def plot_history(points: List[Tuple[datetime, Optional[int]]], title: str, start
     fig.savefig(buffer, format="png")
     buffer.seek(0)
     plt.close(fig)
+    gc.collect()
     return buffer
 
 
@@ -1118,10 +1123,10 @@ async def tracker() -> None:
 
     try:
         top_data = await fetch_top_data()
-        storage = load_event_storage(top_data)
-        changed = record_rankings(top_data, storage)
+        storage = await asyncio.to_thread(load_event_storage, top_data)
+        changed = await asyncio.to_thread(record_rankings, top_data, storage)
         if changed:
-            save_json(DATA_FILE, storage)
+            await asyncio.to_thread(save_json, DATA_FILE, storage)
         TRACKER_BACKOFF_UNTIL = None
     except requests.exceptions.RequestException as exc:
         TRACKER_BACKOFF_UNTIL = datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -1268,7 +1273,8 @@ async def bind(ctx: commands.Context, id: str) -> None:
 @app_commands.describe(mode="總榜或章節榜")
 @app_commands.choices(mode=MODE_CHOICES)
 async def graph(ctx: commands.Context, mode: str = "total") -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     mode = normalize_mode(mode)
 
     bound_id = load_bound_ids().get(str(ctx.author.id), {}).get("game_id")
@@ -1277,7 +1283,7 @@ async def graph(ctx: commands.Context, mode: str = "total") -> None:
         return
 
     top_data = await fetch_top_data()
-    storage = load_event_storage(top_data)
+    storage = await asyncio.to_thread(load_event_storage, top_data)
     dataset = dataset_for_mode(storage, top_data, mode)
     start_at = start_time_for_mode(top_data, mode)
     points = history_for_player_id(dataset, str(bound_id), start_at)
@@ -1296,7 +1302,8 @@ async def graph(ctx: commands.Context, mode: str = "total") -> None:
 @app_commands.describe(mode="總榜或章節榜", rank="要追蹤的名次")
 @app_commands.choices(mode=MODE_CHOICES)
 async def trackgraph(ctx: commands.Context, mode: str, rank: int) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     mode = normalize_mode(mode)
 
     if rank <= 0:
@@ -1309,7 +1316,7 @@ async def trackgraph(ctx: commands.Context, mode: str, rank: int) -> None:
         await ctx.send(f"目前只有 {len(rankings)} 筆排名資料。")
         return
 
-    storage = load_event_storage(top_data)
+    storage = await asyncio.to_thread(load_event_storage, top_data)
     dataset = dataset_for_mode(storage, top_data, mode)
     start_at = start_time_for_mode(top_data, mode)
     points = history_for_rank(dataset, rank, start_at)
@@ -1323,7 +1330,8 @@ async def trackgraph(ctx: commands.Context, mode: str, rank: int) -> None:
 @app_commands.describe(mode="總榜或章節榜", rank="目前名次")
 @app_commands.choices(mode=MODE_CHOICES)
 async def rankgraph(ctx: commands.Context, mode: str, rank: int) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     mode = normalize_mode(mode)
 
     top_data = await fetch_top_data()
@@ -1334,7 +1342,7 @@ async def rankgraph(ctx: commands.Context, mode: str, rank: int) -> None:
 
     target = rankings[rank - 1]
     target_id = player_id(target)
-    storage = load_event_storage(top_data)
+    storage = await asyncio.to_thread(load_event_storage, top_data)
     dataset = dataset_for_mode(storage, top_data, mode)
     start_at = start_time_for_mode(top_data, mode)
     points = history_for_player_id(dataset, target_id, start_at)
@@ -1348,7 +1356,8 @@ async def rankgraph(ctx: commands.Context, mode: str, rank: int) -> None:
 @app_commands.describe(mode="總榜或章節榜", rank="要查詢的名次，可輸入 14,15,16,17,18 或 14-18，最多 5 名")
 @app_commands.choices(mode=MODE_CHOICES)
 async def trackrank(ctx: commands.Context, mode: str, rank: str) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     mode = normalize_mode(mode)
 
     top_data = await fetch_top_data()
@@ -1371,7 +1380,8 @@ async def trackrank(ctx: commands.Context, mode: str, rank: str) -> None:
 @app_commands.describe(mode="總榜或章節榜")
 @app_commands.choices(mode=MODE_CHOICES)
 async def playerrank(ctx: commands.Context, mode: str = "total") -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     mode = normalize_mode(mode)
 
     bound_id = load_bound_ids().get(str(ctx.author.id), {}).get("game_id")
@@ -1395,7 +1405,8 @@ async def playerrank(ctx: commands.Context, mode: str = "total") -> None:
 @app_commands.describe(mode="總榜或章節榜")
 @app_commands.choices(mode=MODE_CHOICES)
 async def line(ctx: commands.Context, mode: str = "total") -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     mode = normalize_mode(mode)
 
     top_data, border_data = await asyncio.gather(fetch_top_data(), fetch_border_data())
@@ -1406,7 +1417,8 @@ async def line(ctx: commands.Context, mode: str = "total") -> None:
 @bot.hybrid_command(name="analyzemysekai", description="分析上傳的 MySekai JSON")
 @app_commands.describe(file="原始 response、sssekai_mysekai.json 或 sssekai_mysekai_readable.json")
 async def analyze_mysekai_command(ctx: commands.Context, file: discord.Attachment) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     output_dir = upload_output_dir(ctx, "mysekai")
 
     try:
@@ -1426,6 +1438,7 @@ async def analyze_mysekai_command(ctx: commands.Context, file: discord.Attachmen
             no_maps=False,
         )
         await asyncio.to_thread(build_mysekai_report, args)
+        gc.collect()
         zip_path = zip_report_dir(output_dir, f"{output_dir.name}.zip")
         remember_analysis(ctx.author.id, "mysekai", output_dir, zip_path)
     except (ValueError, SnapshotPipelineError) as exc:
@@ -1480,6 +1493,7 @@ async def run_profile_snapshot_analysis(
             event_top100_url="https://api.hisekai.org/{server}/event/{event_id}/top100",
         )
         await asyncio.to_thread(build_profile_report, args)
+        gc.collect()
         zip_path = zip_report_dir(output_dir, f"{output_dir.name}.zip")
         remember_analysis(ctx.author.id, "profile", output_dir, zip_path)
     except (ValueError, SnapshotPipelineError) as exc:
@@ -1513,7 +1527,8 @@ async def analyze_profile_command(
     fetch_top100_history: bool = False,
     max_events: int = 40,
 ) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     await run_profile_snapshot_analysis(ctx, file, fetch_hisekai, fetch_top100_history, max_events)
 
 
@@ -1531,7 +1546,8 @@ async def analyze_suite_command(
     fetch_top100_history: bool = False,
     max_events: int = 40,
 ) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     await run_profile_snapshot_analysis(ctx, file, fetch_hisekai, fetch_top100_history, max_events)
 
 
@@ -1549,7 +1565,8 @@ async def upload_suite_command(
     fetch_top100_history: bool = False,
     max_events: int = 40,
 ) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     await run_profile_snapshot_analysis(ctx, file, fetch_hisekai, fetch_top100_history, max_events, send_zip=False)
 
 
@@ -1735,7 +1752,8 @@ async def suite_music_image_command(
     mode: str = "difficulty",
     value: str = "master",
 ) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     output_dir = last_analysis_dir(ctx.author.id, "profile")
     if not output_dir:
         await ctx.send("還沒有你的 Suite 資料，請先使用 `/uploadsuite file` 或 `/analyzesuite file` 上傳。")
@@ -1747,6 +1765,7 @@ async def suite_music_image_command(
         return
 
     image_names = await asyncio.to_thread(draw_music_status_query_pages, rows, output_dir, mode=mode, value=value, per_page=30)
+    gc.collect()
     if not image_names:
         await ctx.send("沒有符合條件的歌曲資料。")
         return
@@ -1992,7 +2011,8 @@ async def pjsk_update_scores_command(
     force_download: bool = False,
     limit: Optional[int] = None,
 ) -> None:
-    await ctx.defer()
+    if not await safe_ctx_defer(ctx):
+        return
     selected = None if difficulty == "all" else {difficulty}
     payload = await run_pjsk_score_update(
         reason="discord-command",
