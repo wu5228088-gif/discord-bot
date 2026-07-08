@@ -1115,7 +1115,7 @@ PJSK_SCORE_UPDATE_LOCK = asyncio.Lock()
 TRACKER_BACKOFF_UNTIL: datetime | None = None
 
 
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=10)
 async def tracker() -> None:
     global TRACKER_BACKOFF_UNTIL
     if TRACKER_BACKOFF_UNTIL and datetime.now(timezone.utc) < TRACKER_BACKOFF_UNTIL:
