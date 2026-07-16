@@ -1113,9 +1113,14 @@ bot.remove_command("help")
 bot.synced_commands_once = False
 PJSK_SCORE_UPDATE_LOCK = asyncio.Lock()
 TRACKER_BACKOFF_UNTIL: datetime | None = None
+PJSK_MASTER_UPDATE_FILES = ("musics.json", "musicDifficulties.json")
+PJSK_MASTER_BASE_URL = os.getenv(
+    "PJSK_SCORE_MASTER_BASE_URL",
+    "https://sekai-world.github.io/sekai-master-db-diff",
+).rstrip("/")
 
 
-@tasks.loop(minutes=10)
+@tasks.loop(minutes=1)
 async def tracker() -> None:
     global TRACKER_BACKOFF_UNTIL
     if TRACKER_BACKOFF_UNTIL and datetime.now(timezone.utc) < TRACKER_BACKOFF_UNTIL:
@@ -1138,6 +1143,69 @@ async def tracker() -> None:
 @tracker.before_loop
 async def before_tracker() -> None:
     await bot.wait_until_ready()
+
+
+def fetch_pjsk_master_update_files() -> dict[str, str]:
+    files: dict[str, str] = {}
+    for filename in PJSK_MASTER_UPDATE_FILES:
+        response = SESSION.get(
+            f"{PJSK_MASTER_BASE_URL}/{filename}",
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        files[filename] = response.text
+    return files
+
+
+def apply_pjsk_master_update_if_changed(master_dir: Path, files: dict[str, str]) -> bool:
+    master_dir.mkdir(parents=True, exist_ok=True)
+    changed = False
+    for filename, content in files.items():
+        path = master_dir / filename
+        old_content = path.read_text(encoding="utf-8") if path.exists() else None
+        if old_content == content:
+            continue
+        path.write_text(content, encoding="utf-8")
+        changed = True
+    return changed
+
+
+async def check_pjsk_master_update_once(reason: str) -> bool:
+    master_dir = pjsk_default_master_dir()
+    files = await asyncio.to_thread(fetch_pjsk_master_update_files)
+    changed = await asyncio.to_thread(apply_pjsk_master_update_if_changed, master_dir, files)
+    if not changed:
+        log.info("PJSK master auto-check found no changes: %s", reason)
+        return False
+
+    log.info("PJSK master changed; rebuilding score analysis: %s", reason)
+    await run_pjsk_score_update(
+        reason=reason,
+        force_download=False,
+        auto_update_menu=False,
+    )
+    return True
+
+
+@tasks.loop(hours=24)
+async def pjsk_auto_score_update() -> None:
+    if not env_flag("PJSK_AUTO_SCORE_UPDATE", True):
+        return
+
+    try:
+        await check_pjsk_master_update_once("auto-master-check")
+    except requests.exceptions.RequestException as exc:
+        log.warning("PJSK master auto-check failed temporarily: %s", exc)
+    except Exception:
+        log.exception("PJSK master auto-check failed")
+
+
+@pjsk_auto_score_update.before_loop
+async def before_pjsk_auto_score_update() -> None:
+    await bot.wait_until_ready()
+    interval_hours = float(os.getenv("PJSK_AUTO_SCORE_UPDATE_INTERVAL_HOURS", "24"))
+    if interval_hours > 0:
+        pjsk_auto_score_update.change_interval(hours=interval_hours)
 
 
 async def run_pjsk_score_update(
@@ -1226,6 +1294,9 @@ async def on_ready() -> None:
 
     if not tracker.is_running():
         tracker.start()
+
+    if not pjsk_auto_score_update.is_running():
+        pjsk_auto_score_update.start()
 
     if not bot.synced_commands_once:
         try:
