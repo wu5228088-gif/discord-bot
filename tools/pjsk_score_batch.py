@@ -582,11 +582,21 @@ def score_power_multiplier_for_chart(
     multipliers = normalize_skill_multipliers(skill_multipliers)
     suffix = "" if use_fever else "_no_fever"
     base = chart.get(f"score_base_power_multiplier{suffix}")
+    min_terms = chart.get(f"skill_score_terms_min{suffix}")
+    max_terms = chart.get(f"skill_score_terms_max{suffix}")
+    if base is not None and min_terms and max_terms:
+        low = float(base) + sum(float(term) * (multipliers[i] - 1.0) for i, term in enumerate(min_terms[:6]))
+        high = float(base) + sum(float(term) * (multipliers[i] - 1.0) for i, term in enumerate(max_terms[:6]))
+        return (low + high) / 2
+
+    if multipliers == [3.0] * 6 and chart.get(f"score_power_multiplier_min{suffix}") is not None:
+        low = float(chart.get(f"score_power_multiplier_min{suffix}"))
+        high = float(chart.get(f"score_power_multiplier_max{suffix}", low))
+        return (low + high) / 2
+
     terms = chart.get(f"skill_score_terms{suffix}")
     if base is None or not terms:
         default_score = float(chart.get(f"score_power_multiplier{suffix}", chart["score_power_multiplier"]))
-        if multipliers == [3.0] * 6:
-            return default_score
         return default_score
     return float(base) + sum(float(term) * (multipliers[i] - 1.0) for i, term in enumerate(terms[:6]))
 
