@@ -1182,7 +1182,7 @@ async def check_pjsk_master_update_once(reason: str) -> bool:
     await run_pjsk_score_update(
         reason=reason,
         force_download=False,
-        auto_update_menu=False,
+        auto_update_menu=True,
     )
     return True
 
