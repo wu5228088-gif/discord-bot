@@ -11,6 +11,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -22,6 +23,7 @@ ASSETS_HOST = "https://assets-direct.unipjsk.com"
 BONUS_MULTIPLIERS = {1: 5, 2: 10, 3: 15, 4: 20, 5: 25, 6: 27, 7: 29, 8: 31, 9: 33, 10: 35}
 NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 SUS_DOWNLOAD_HEADERS = {"User-Agent": "hisekai-pjsk-score-batch/1.0"}
+DEFAULT_LENGTH_OVERRIDES_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrxLZNUjy8RctfuipN89XyM6VXsANmkDgKOVrOZeC7fdBsPDL4_pHBpDW7yvdrUI4W09XmUAApbgpC/pub?output=csv"
 
 
 def default_length_xlsx() -> Path:
@@ -31,6 +33,20 @@ def default_length_xlsx() -> Path:
 def default_length_overrides(data_dir: Path | None = None) -> Path:
     root = data_dir or Path(os.getenv("BOT_DATA_DIR") or Path.cwd())
     return Path(os.getenv("PJSK_LENGTH_OVERRIDES", str(root / "pjsk_length_overrides.csv")))
+
+
+def length_overrides_google_csv_url() -> str:
+    url = os.getenv("PJSK_LENGTH_OVERRIDES_CSV_URL", DEFAULT_LENGTH_OVERRIDES_URL).strip()
+    parsed = urlparse(url)
+    match = re.search(r"/spreadsheets/d/([^/]+)", parsed.path)
+    if not match or "output=csv" in parsed.query or "/pub" in parsed.path or "/gviz/" in parsed.path:
+        return url
+
+    sheet_id = match.group(1)
+    query_gid = parse_qs(parsed.query).get("gid", [None])[0]
+    fragment_gid = parse_qs(parsed.fragment).get("gid", [None])[0]
+    gid = query_gid or fragment_gid or "0"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
 
 
 def default_master_dir() -> Path:
@@ -387,7 +403,7 @@ def update_master_cache(master_dir: Path) -> bool:
 
 
 def update_length_overrides_from_google(data_dir: Path) -> None:
-    google_csv_url = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTrxLZNUjy8RctfuipN89XyM6VXsANmkDgKOVrOZeC7fdBsPDL4_pHBpDW7yvdrUI4W09XmUAApbgpC/pub?output=csv"
+    google_csv_url = length_overrides_google_csv_url()
 
     print("正在從 Google 試算表下載最新的長度倍率...")
     try:
