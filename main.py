@@ -1159,6 +1159,192 @@ async def line(ctx: commands.Context, mode: str = "total") -> None:
     await safe_ctx_send(ctx, embed=embed)
 
 
+PJSK_SCORE_SONG_INDEX_CACHE: list[dict[str, Any]] = []
+PJSK_SCORE_SONG_INDEX_MTIME: float | None = None
+
+
+def pjsk_score_song_index_path() -> Path:
+    return DATA_DIR / "pjsk_score_song_index.json"
+
+
+def load_pjsk_score_song_index() -> list[dict[str, Any]]:
+    global PJSK_SCORE_SONG_INDEX_CACHE, PJSK_SCORE_SONG_INDEX_MTIME
+    path = pjsk_score_song_index_path()
+    if not path.exists():
+        PJSK_SCORE_SONG_INDEX_CACHE = []
+        PJSK_SCORE_SONG_INDEX_MTIME = None
+        return []
+
+    mtime = path.stat().st_mtime
+    if PJSK_SCORE_SONG_INDEX_MTIME == mtime:
+        return PJSK_SCORE_SONG_INDEX_CACHE
+
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("PJSK song index load failed: %s", path)
+        PJSK_SCORE_SONG_INDEX_CACHE = []
+        PJSK_SCORE_SONG_INDEX_MTIME = None
+        return []
+
+    PJSK_SCORE_SONG_INDEX_CACHE = rows if isinstance(rows, list) else []
+    PJSK_SCORE_SONG_INDEX_MTIME = mtime
+    return PJSK_SCORE_SONG_INDEX_CACHE
+
+
+def write_pjsk_score_song_index_from_analysis(analysis: dict[str, Any]) -> None:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for chart in analysis.get("charts", []):
+        try:
+            music_id = int(chart["music_id"])
+            difficulty = str(chart["difficulty"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        key = (music_id, difficulty)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "music_id": music_id,
+                "title": str(chart.get("title") or ""),
+                "difficulty": difficulty,
+                "level": int(chart.get("level") or 0),
+            }
+        )
+    rows.sort(key=lambda row: (row["music_id"], row["difficulty"]))
+    path = pjsk_score_song_index_path()
+    path.write_text(json.dumps(rows, ensure_ascii=False), encoding="utf-8")
+    load_pjsk_score_song_index()
+
+
+def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
+    return load_pjsk_score_analysis(DATA_DIR)
+
+
+async def load_pjsk_score_cache_or_none_async() -> dict[str, Any] | None:
+    return await asyncio.to_thread(load_pjsk_score_cache_or_none)
+
+
+def resolve_skill_multipliers(
+    mode: str = "single",
+    skill_multiplier: float = 3.7,
+    skill1: Optional[float] = None,
+    skill2: Optional[float] = None,
+    skill3: Optional[float] = None,
+    skill4: Optional[float] = None,
+    skill5: Optional[float] = None,
+    skill6: Optional[float] = None,
+) -> list[float]:
+    default_multiplier = 3.7 if skill_multiplier is None else float(skill_multiplier)
+    if mode == "custom":
+        values = [skill1, skill2, skill3, skill4, skill5, skill6]
+        return [float(value if value is not None else default_multiplier) for value in values]
+    return [default_multiplier] * 6
+
+
+def active_bonus_power_multiplier_for_mode(mode: str) -> float:
+    return 0.375 if mode == "multi" else 0.0
+
+
+def format_number_range(low: float, high: float, *, digits: int = 0, suffix: str = "") -> str:
+    if abs(low - high) < 10 ** (-(digits + 1)):
+        return f"{low:.{digits}f}{suffix}"
+    return f"{low:.{digits}f}-{high:.{digits}f}{suffix}"
+
+
+def format_skill_coverages(
+    chart: dict[str, Any],
+    skill_multipliers: list[float] | None = None,
+    *,
+    team_power: int | None = None,
+    total_score: float | None = None,
+    use_fever: bool = True,
+) -> str:
+    multipliers = skill_multipliers or [3.7] * 6
+    parts = []
+    suffix = "" if use_fever else "_no_fever"
+    skill_terms = chart.get(f"skill_score_terms{suffix}") or chart.get("skill_score_terms") or []
+    skill_terms_min = chart.get(f"skill_score_terms_min{suffix}") or chart.get("skill_score_terms_min") or skill_terms
+    skill_terms_max = chart.get(f"skill_score_terms_max{suffix}") or chart.get("skill_score_terms_max") or skill_terms
+
+    for row in chart.get("skill_coverages", [])[:6]:
+        index = int(row["index"])
+        multiplier = multipliers[index - 1] if index - 1 < len(multipliers) else multipliers[-1]
+        fever_weight = float(row.get("fever_covered_weight") or 0)
+
+        segment_score_min = None
+        segment_score_max = None
+        segment_pct_min = None
+        segment_pct_max = None
+        segment_multiplier_min = None
+        segment_multiplier_max = None
+
+        if index - 1 < len(skill_terms):
+            segment_multiplier_min = float(skill_terms_min[index - 1]) * multiplier
+            segment_multiplier_max = float(skill_terms_max[index - 1]) * multiplier
+
+            if team_power is not None and total_score:
+                segment_score_min = segment_multiplier_min * team_power
+                segment_score_max = segment_multiplier_max * team_power
+                segment_pct_min = segment_score_min / total_score * 100 if total_score else 0.0
+                segment_pct_max = segment_score_max / total_score * 100 if total_score else 0.0
+
+        coverage_low = float(row.get("coverage_pct_min", row["coverage_pct"]))
+        coverage_high = float(row.get("coverage_pct_max", row["coverage_pct"]))
+        coverage_text = format_number_range(coverage_low, coverage_high, digits=2, suffix="%")
+
+        if team_power is not None and segment_score_min is not None:
+            score_text = (
+                "｜段分數 "
+                f"{format_number_range(segment_score_min, segment_score_max, digits=0)} "
+                f"({format_number_range(segment_pct_min, segment_pct_max, digits=2, suffix='%')})"
+            )
+        elif segment_multiplier_min is not None:
+            score_text = (
+                "｜段分數 "
+                f"{format_number_range(segment_multiplier_min, segment_multiplier_max, digits=4, suffix='x')}"
+            )
+        else:
+            score_text = ""
+
+        fever_tag = f"｜fever重疊 {float(row.get('fever_overlap_pct') or 0):.1f}%" if fever_weight > 0 else ""
+        line = f"S{index} x{multiplier:g}: 覆蓋 {coverage_text}{score_text}{fever_tag}"
+        if fever_weight > 0:
+            line = f"**{line}**"
+        parts.append(line)
+
+    return "\n".join(parts) if parts else "沒有技能段資料"
+
+
+def format_score_rank_line(index: int, row: dict[str, Any], sort_by: str) -> str:
+    length_note = " 缺長度" if row.get("length_missing") else ""
+    prefix = f"`#{index:02d}` **{row['title']}** {row['difficulty'].upper()} Lv.{row['level']}｜"
+    if sort_by == "event_pt":
+        pt_text = format_number_range(
+            float(row.get("event_pt_min", row["event_pt"])),
+            float(row.get("event_pt_max", row["event_pt"])),
+            digits=0,
+        )
+        return f"{prefix}{pt_text}pt{length_note}"
+    if sort_by == "score":
+        score_text = format_number_range(
+            float(row.get("score_min", row["score"])),
+            float(row.get("score_max", row["score"])),
+            digits=0,
+        )
+        return f"{prefix}理論分數 {score_text}"
+    score_text = ""
+    if row.get("score") is not None:
+        score_text = "｜理論分數 " + format_number_range(
+            float(row.get("score_min", row["score"])),
+            float(row.get("score_max", row["score"])),
+            digits=0,
+        )
+    return f"{prefix}技能 {row['skill_coverage_pct_total']:.2f}%{score_text}"
+
+
 @bot.hybrid_command(name="pjskrank", description="依綜合力/活動倍率/火數計算活動pt排行")
 @app_commands.describe(
     power="綜合力；依活動pt/理論分數排行時需要",
@@ -1653,6 +1839,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
