@@ -920,15 +920,14 @@ async def run_pjsk_score_update(
 
 async def ensure_pjsk_score_cache_on_startup() -> None:
     cache_file = pjsk_score_cache_path(DATA_DIR)
-    startup_update_enabled = env_flag("PJSK_STARTUP_SCORE_UPDATE", False)
+    startup_update_enabled = env_flag("PJSK_STARTUP_SCORE_UPDATE", True)
     if cache_file.exists():
         analysis = await asyncio.to_thread(load_pjsk_score_analysis, DATA_DIR)
         cache_complete = bool(analysis.get("complete", True)) if analysis else False
         if not cache_complete:
             if not startup_update_enabled:
                 log.warning(
-                    "PJSK score cache is partial; startup auto-resume is disabled. "
-                    "Set PJSK_STARTUP_SCORE_UPDATE=1 to resume on startup."
+                    "PJSK score cache is partial; startup auto-resume is disabled by PJSK_STARTUP_SCORE_UPDATE."
                 )
                 return
             log.info("PJSK score cache is partial; startup will resume SUS analysis: %s", cache_file)
@@ -947,8 +946,7 @@ async def ensure_pjsk_score_cache_on_startup() -> None:
 
     if not startup_update_enabled:
         log.warning(
-            "PJSK score cache is missing; startup full SUS analysis is disabled. "
-            "Set PJSK_STARTUP_SCORE_UPDATE=1 to build it on startup."
+            "PJSK score cache is missing; startup full SUS analysis is disabled by PJSK_STARTUP_SCORE_UPDATE."
         )
         return
 
@@ -1001,8 +999,15 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         await safe_ctx_send(ctx, "參數格式錯誤，請確認 rank 是數字。")
         return
 
+    original = getattr(error, "original", error)
     log.exception("Command error: %s", error)
-    await safe_ctx_send(ctx, "指令執行時發生錯誤，請稍後再試。")
+    detail = str(original).strip()
+    if len(detail) > 180:
+        detail = detail[:177] + "..."
+    if detail:
+        await safe_ctx_send(ctx, f"指令執行時發生錯誤：`{type(original).__name__}` {detail}")
+    else:
+        await safe_ctx_send(ctx, f"指令執行時發生錯誤：`{type(original).__name__}`")
 
 
 @bot.hybrid_command(name="bind", description="綁定你的遊戲玩家 ID")
@@ -1011,7 +1016,7 @@ async def bind(ctx: commands.Context, id: str) -> None:
     bound_ids = load_bound_ids()
     bound_ids[str(ctx.author.id)] = {"game_id": str(id)}
     save_bound_ids(bound_ids)
-    await ctx.send(f"已綁定玩家 ID：`{id}`")
+    await safe_ctx_send(ctx, f"已綁定玩家 ID：`{id}`")
 
 
 @bot.hybrid_command(name="trackrank", description="查詢指定名次的即時資訊")
@@ -1022,11 +1027,19 @@ async def trackrank(ctx: commands.Context, mode: str, rank: str) -> None:
         return
     mode = normalize_mode(mode)
 
-    top_data = await fetch_top_data()
+    try:
+        top_data = await fetch_top_data()
+    except requests.exceptions.RequestException as exc:
+        log.warning("HiSekai top100 API request failed: %s", exc)
+        await safe_ctx_send(ctx, "目前連不上 HiSekai Top100 API，請稍後再試。")
+        return
     rankings = get_rankings(top_data, mode)
+    if not rankings:
+        await safe_ctx_send(ctx, "目前 API 沒有回傳可用的排名資料。")
+        return
     ranks, error_message = parse_rank_query(rank, len(rankings))
     if error_message:
-        await ctx.send(error_message)
+        await safe_ctx_send(ctx, error_message)
         return
 
     embeds = []
@@ -1035,7 +1048,7 @@ async def trackrank(ctx: commands.Context, mode: str, rank: str) -> None:
         player = rankings[index]
         embeds.append(make_player_embed(player, rankings, index, mode_label(mode, top_data)))
 
-    await ctx.send(embeds=embeds)
+    await safe_ctx_send(ctx, embeds=embeds)
 
 
 @bot.hybrid_command(name="playerrank", description="查詢已綁定玩家的目前排名")
@@ -1048,19 +1061,27 @@ async def playerrank(ctx: commands.Context, mode: str = "total") -> None:
 
     bound_id = load_bound_ids().get(str(ctx.author.id), {}).get("game_id")
     if not bound_id:
-        await ctx.send("尚未綁定玩家 ID，請先使用 `/bind id`。")
+        await safe_ctx_send(ctx, "尚未綁定玩家 ID，請先使用 `/bind id`。")
         return
 
-    top_data = await fetch_top_data()
+    try:
+        top_data = await fetch_top_data()
+    except requests.exceptions.RequestException as exc:
+        log.warning("HiSekai top100 API request failed: %s", exc)
+        await safe_ctx_send(ctx, "目前連不上 HiSekai Top100 API，請稍後再試。")
+        return
     rankings = get_rankings(top_data, mode)
+    if not rankings:
+        await safe_ctx_send(ctx, "目前 API 沒有回傳可用的排名資料。")
+        return
 
     for index, player in enumerate(rankings):
         if player_id(player) == str(bound_id):
             embed = make_player_embed(player, rankings, index, mode_label(mode, top_data))
-            await ctx.send(embed=embed)
+            await safe_ctx_send(ctx, embed=embed)
             return
 
-    await ctx.send("目前 Top 100 內找不到這個玩家。")
+    await safe_ctx_send(ctx, "目前 Top 100 內找不到這個玩家。")
 
 
 @bot.hybrid_command(name="line", description="查詢目前活動榜線")
@@ -1071,9 +1092,14 @@ async def line(ctx: commands.Context, mode: str = "total") -> None:
         return
     mode = normalize_mode(mode)
 
-    top_data, border_data = await asyncio.gather(fetch_top_data(), fetch_border_data())
+    try:
+        top_data, border_data = await asyncio.gather(fetch_top_data(), fetch_border_data())
+    except requests.exceptions.RequestException as exc:
+        log.warning("HiSekai border API request failed: %s", exc)
+        await safe_ctx_send(ctx, "目前連不上 HiSekai 榜線 API，請稍後再試。")
+        return
     embed = rank_line_embed(border_data, top_data, mode)
-    await ctx.send(embed=embed)
+    await safe_ctx_send(ctx, embed=embed)
 
 
 @bot.hybrid_command(name="pjskrank", description="依綜合力/活動倍率/火數計算活動pt排行")
@@ -1126,7 +1152,7 @@ async def pjsk_rank_command(
 
     analysis = await load_pjsk_score_cache_or_none_async()
     if not analysis:
-        await safe_ctx_send(ctx, "還沒有 PJSK 分析快取；請先使用完整 bot 建立快取，或設定 `PJSK_STARTUP_SCORE_UPDATE=1` 讓這份程式啟動時建立。")
+        await safe_ctx_send(ctx, "還沒有 PJSK 分析快取；這份程式預設會在啟動時自動建立，請稍等更新完成後再試。")
         return
     if sort_by in {"event_pt", "score"} and power is None:
         await safe_ctx_send(ctx, "依活動pt或理論分數排行需要填 `power`；若只想看覆蓋率，排序請選 `技能覆蓋率`。")
@@ -1227,7 +1253,7 @@ async def pjsk_chart_command(
 
     analysis = await load_pjsk_score_cache_or_none_async()
     if not analysis:
-        await safe_ctx_send(ctx, "還沒有 PJSK 分析快取；請先使用完整 bot 建立快取，或設定 `PJSK_STARTUP_SCORE_UPDATE=1` 讓這份程式啟動時建立。")
+        await safe_ctx_send(ctx, "還沒有 PJSK 分析快取；這份程式預設會在啟動時自動建立，請稍等更新完成後再試。")
         return
     chart = find_pjsk_score_chart(analysis, song, difficulty)
     if not chart:
@@ -1384,7 +1410,7 @@ async def pjsk_chart_all_command(
 
     analysis = await load_pjsk_score_cache_or_none_async()
     if not analysis:
-        await safe_ctx_send(ctx, "還沒有 PJSK 分析快取；請先使用完整 bot 建立快取，或設定 `PJSK_STARTUP_SCORE_UPDATE=1` 讓這份程式啟動時建立。")
+        await safe_ctx_send(ctx, "還沒有 PJSK 分析快取；這份程式預設會在啟動時自動建立，請稍等更新完成後再試。")
         return
 
     charts = find_pjsk_score_charts_for_song(analysis, song)
@@ -1497,7 +1523,7 @@ async def help_command(ctx: commands.Context) -> None:
         ),
         color=EMBED_COLOR,
     )
-    await ctx.send(embed=embed)
+    await safe_ctx_send(ctx, embed=embed)
 
 
 class HealthRequestHandler(BaseHTTPRequestHandler):
