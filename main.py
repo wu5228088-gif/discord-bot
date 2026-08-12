@@ -721,6 +721,63 @@ def make_player_embed(
     return embed
 
 
+def border_rankings(border_data: Dict[str, Any], top_data: Dict[str, Any], mode: str) -> List[Dict[str, Any]]:
+    if mode == "chapter" and is_world_link(top_data):
+        chapter_index = current_chapter_index(top_data)
+        chapters = border_data.get("world_link_border_rankings", [])
+        if isinstance(chapters, list) and 0 <= chapter_index < len(chapters):
+            chapter = chapters[chapter_index]
+            if isinstance(chapter, dict):
+                for key in ("player_borders", "player_border_rankings", "borders"):
+                    value = chapter.get(key)
+                    if isinstance(value, list):
+                        return [item for item in value if isinstance(item, dict)]
+        return []
+
+    for key in ("player_border_rankings", "player_borders", "borders"):
+        value = border_data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def rank_line_embed(
+    border_data: Dict[str, Any],
+    top_data: Dict[str, Any],
+    mode: str,
+) -> discord.Embed:
+    rankings = get_rankings(top_data, mode)
+    borders = border_rankings(border_data, top_data, mode)
+    wanted_ranks = {10, 20, 30, 40, 50}
+    rows: Dict[int, int] = {}
+
+    for player in rankings:
+        rank = int(player.get("rank") or 0)
+        if rank in wanted_ranks:
+            rows[rank] = int(player.get("score") or 0)
+
+    for border in borders:
+        rank = int(border.get("rank") or 0)
+        score = int(border.get("score") or 0)
+        if rank:
+            rows[rank] = score
+
+    description = "\n".join(
+        f"{rank} 位：`{format_number(score)}`"
+        for rank, score in sorted(rows.items())
+    )
+    if not description:
+        description = "目前沒有榜線資料。"
+
+    embed = discord.Embed(
+        title=f"{event_name(top_data)} {mode_label(mode, top_data)}",
+        description=description,
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text=f"最後更新於: {now_text()}")
+    return embed
+
+
 def history_for_player_id(
     dataset: Iterable[Dict[str, Any]],
     target_id: str,
@@ -1596,5 +1653,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
