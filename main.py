@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -947,6 +948,7 @@ async def run_pjsk_score_update(
     limit: Optional[int] = None,
     auto_update_menu: bool = True,
 ) -> dict[str, Any]:
+    global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_MTIME
     if PJSK_SCORE_UPDATE_LOCK.locked():
         log.info("PJSK score update skipped because another update is running: %s", reason)
         existing = await asyncio.to_thread(load_pjsk_score_analysis, DATA_DIR)
@@ -954,6 +956,9 @@ async def run_pjsk_score_update(
 
     async with PJSK_SCORE_UPDATE_LOCK:
         log.info("PJSK score update started: %s", reason)
+        PJSK_SCORE_ANALYSIS_CACHE = None
+        PJSK_SCORE_ANALYSIS_MTIME = None
+        gc.collect()
         payload = await asyncio.to_thread(
             build_pjsk_score_analysis,
             DATA_DIR,
@@ -966,6 +971,9 @@ async def run_pjsk_score_update(
         if not pjsk_score_song_index_path().exists():
             await asyncio.to_thread(write_pjsk_score_song_index_from_analysis, payload)
         await asyncio.to_thread(load_pjsk_score_song_index)
+        cache_file = pjsk_score_cache_path(DATA_DIR)
+        PJSK_SCORE_ANALYSIS_CACHE = payload
+        PJSK_SCORE_ANALYSIS_MTIME = cache_file.stat().st_mtime if cache_file.exists() else None
         log.info(
             "PJSK score update finished: %s charts=%s errors=%s",
             reason,
@@ -1021,8 +1029,10 @@ async def on_ready() -> None:
         bot.pjsk_startup_cache_task_started = True
         bot.loop.create_task(ensure_pjsk_score_cache_on_startup())
 
-    if not tracker.is_running():
+    if env_flag("TRACKER_ENABLED", False) and not tracker.is_running():
         tracker.start()
+    elif not env_flag("TRACKER_ENABLED", False):
+        log.info("Background tracker is disabled by TRACKER_ENABLED.")
 
     if not pjsk_auto_score_update.is_running():
         pjsk_auto_score_update.start()
@@ -1161,6 +1171,8 @@ async def line(ctx: commands.Context, mode: str = "total") -> None:
 
 PJSK_SCORE_SONG_INDEX_CACHE: list[dict[str, Any]] = []
 PJSK_SCORE_SONG_INDEX_MTIME: float | None = None
+PJSK_SCORE_ANALYSIS_CACHE: dict[str, Any] | None = None
+PJSK_SCORE_ANALYSIS_MTIME: float | None = None
 
 
 def pjsk_score_song_index_path() -> Path:
@@ -1220,7 +1232,21 @@ def write_pjsk_score_song_index_from_analysis(analysis: dict[str, Any]) -> None:
 
 
 def load_pjsk_score_cache_or_none() -> dict[str, Any] | None:
-    return load_pjsk_score_analysis(DATA_DIR)
+    global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_MTIME
+    path = pjsk_score_cache_path(DATA_DIR)
+    if not path.exists():
+        PJSK_SCORE_ANALYSIS_CACHE = None
+        PJSK_SCORE_ANALYSIS_MTIME = None
+        return None
+
+    mtime = path.stat().st_mtime
+    if PJSK_SCORE_ANALYSIS_CACHE is not None and PJSK_SCORE_ANALYSIS_MTIME == mtime:
+        return PJSK_SCORE_ANALYSIS_CACHE
+
+    analysis = load_pjsk_score_analysis(DATA_DIR)
+    PJSK_SCORE_ANALYSIS_CACHE = analysis
+    PJSK_SCORE_ANALYSIS_MTIME = mtime
+    return analysis
 
 
 async def load_pjsk_score_cache_or_none_async() -> dict[str, Any] | None:
@@ -1345,6 +1371,71 @@ def format_score_rank_line(index: int, row: dict[str, Any], sort_by: str) -> str
     return f"{prefix}技能 {row['skill_coverage_pct_total']:.2f}%{score_text}"
 
 
+def lightweight_rank_rows(
+    analysis: dict[str, Any],
+    *,
+    power: Optional[int],
+    event_multiplier: float,
+    bonus: int,
+    skill_multipliers: list[float],
+    active_bonus: float,
+    use_fever: bool,
+    difficulty: str,
+    sort_by: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for chart in analysis.get("charts", []):
+        if difficulty != "all" and chart["difficulty"] != difficulty:
+            continue
+
+        total_weight = float(chart.get("total_weight") or 0)
+        skill_total = sum(float(row.get("covered_weight") or 0) for row in chart.get("skill_coverages", []))
+        row: dict[str, Any] = {
+            "title": chart.get("title", ""),
+            "difficulty": chart.get("difficulty", ""),
+            "level": chart.get("level", 0),
+            "skill_coverage_pct_total": skill_total / total_weight * 100 if total_weight else 0.0,
+            "score": None,
+        }
+
+        if power is not None:
+            calc = calculate_event_points(
+                chart,
+                power,
+                event_multiplier,
+                bonus,
+                skill_multipliers,
+                active_bonus,
+                use_fever,
+            )
+            row.update(
+                {
+                    "score": calc["score"],
+                    "score_min": calc.get("score_min", calc["score"]),
+                    "score_max": calc.get("score_max", calc["score"]),
+                    "event_pt": calc["event_pt"],
+                    "event_pt_min": calc.get("event_pt_min", calc["event_pt"]),
+                    "event_pt_max": calc.get("event_pt_max", calc["event_pt"]),
+                    "score_power_multiplier": calc.get("score_power_multiplier", 0),
+                    "score_power_multiplier_max": calc.get("score_power_multiplier_max", calc.get("score_power_multiplier", 0)),
+                    "length_missing": calc.get("length_missing", False),
+                }
+            )
+        rows.append(row)
+
+    if sort_by == "skill_coverage_pct_total":
+        rows.sort(key=lambda row: row["skill_coverage_pct_total"], reverse=True)
+    else:
+        rows.sort(
+            key=lambda row: (
+                row.get(f"{sort_by}_max", row.get(sort_by, 0)),
+                row.get("score_power_multiplier_max", row.get("score_power_multiplier", 0)),
+            ),
+            reverse=True,
+        )
+    return rows
+
+
 @bot.hybrid_command(name="pjskrank", description="依綜合力/活動倍率/火數計算活動pt排行")
 @app_commands.describe(
     power="綜合力；依活動pt/理論分數排行時需要",
@@ -1408,33 +1499,16 @@ async def pjsk_rank_command(
     )
     active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
     use_fever = score_mode == "multi"
-    if power is None:
-        rows = []
-        for chart in analysis.get("charts", []):
-            if difficulty != "all" and chart["difficulty"] != difficulty:
-                continue
-            skill_total = sum(float(row["covered_weight"]) for row in chart.get("skill_coverages", []))
-            rows.append(
-                {
-                    **chart,
-                    "skill_coverage_pct_total": skill_total / chart["total_weight"] * 100
-                    if chart["total_weight"]
-                    else 0.0,
-                    "score": None,
-                }
-            )
-        rows.sort(key=lambda row: row["skill_coverage_pct_total"], reverse=True)
-    else:
-        rows = rank_pjsk_score_charts(
-            analysis,
-            team_power=power,
-            event_multiplier=event_multiplier,
-            bonus=bonus,
-            skill_multipliers=skill_multipliers,
-            active_bonus_power_multiplier=active_bonus,
-            use_fever=use_fever,
-            difficulty=difficulty,
-            sort_by=sort_by,
+    rows = lightweight_rank_rows(
+        analysis,
+        power=power,
+        event_multiplier=event_multiplier,
+        bonus=bonus,
+        skill_multipliers=skill_multipliers,
+        active_bonus=active_bonus,
+        use_fever=use_fever,
+        difficulty=difficulty,
+        sort_by=sort_by,
     )
     if not rows:
         await safe_ctx_send(ctx, "沒有符合條件的譜面資料。")
@@ -1443,7 +1517,7 @@ async def pjsk_rank_command(
     skill_label = "技能 " + "/".join(f"{value:g}" for value in skill_multipliers)
     mode_label = "多人" if score_mode == "multi" else "單人/挑戰"
     power_label = f"{power:,}" if power is not None else "未填綜合力"
-    title = f"歌曲排行 {start_rank}-{start_rank + len(page) - 1}｜{mode_label}｜{power_label}｜活動倍率 {event_multiplier:g}｜{bonus}火｜{skill_label}"
+    title = f"PJSK 排行 {start_rank}-{start_rank + len(page) - 1}｜{mode_label}｜{power_label}｜活動倍率 {event_multiplier:g}｜{bonus}火｜{skill_label}"
     await send_query_embed(
         ctx,
         title,
@@ -1839,6 +1913,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
