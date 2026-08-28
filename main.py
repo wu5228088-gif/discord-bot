@@ -1443,7 +1443,7 @@ async def pjsk_rank_command(
     skill_label = "技能 " + "/".join(f"{value:g}" for value in skill_multipliers)
     mode_label = "多人" if score_mode == "multi" else "單人/挑戰"
     power_label = f"{power:,}" if power is not None else "未填綜合力"
-    title = f"PJSK 排行 {start_rank}-{start_rank + len(page) - 1}｜{mode_label}｜{power_label}｜活動倍率 {event_multiplier:g}｜{bonus}火｜{skill_label}"
+    title = f"歌曲排行 {start_rank}-{start_rank + len(page) - 1}｜{mode_label}｜{power_label}｜活動倍率 {event_multiplier:g}｜{bonus}火｜{skill_label}"
     await send_query_embed(
         ctx,
         title,
