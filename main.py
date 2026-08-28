@@ -27,9 +27,9 @@ from tools.pjsk_score_batch import (
     calculate_event_points,
     cache_path as pjsk_score_cache_path,
     default_master_dir as pjsk_default_master_dir,
+    default_length_overrides as pjsk_length_overrides_path,
     find_chart as find_pjsk_score_chart,
     load_analysis as load_pjsk_score_analysis,
-    rank_charts as rank_pjsk_score_charts,
 )
 
 
@@ -819,6 +819,11 @@ def history_for_rank(
     return points
 
 
+def load_bound_ids() -> Dict[str, Dict[str, str]]:
+    data = load_json(ID_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
 def save_bound_ids(data: Dict[str, Dict[str, str]]) -> None:
     save_json(ID_FILE, data)
 
@@ -951,8 +956,13 @@ async def run_pjsk_score_update(
     global PJSK_SCORE_ANALYSIS_CACHE, PJSK_SCORE_ANALYSIS_MTIME
     if PJSK_SCORE_UPDATE_LOCK.locked():
         log.info("PJSK score update skipped because another update is running: %s", reason)
-        existing = await asyncio.to_thread(load_pjsk_score_analysis, DATA_DIR)
-        return existing if existing else {"charts": [], "errors": [], "chart_count": 0, "error_count": 0}
+        return {
+            "charts": [],
+            "errors": [{"error": "another PJSK score update is already running"}],
+            "chart_count": 0,
+            "error_count": 1,
+            "update_running": True,
+        }
 
     async with PJSK_SCORE_UPDATE_LOCK:
         log.info("PJSK score update started: %s", reason)
@@ -1436,6 +1446,57 @@ def lightweight_rank_rows(
     return rows
 
 
+@bot.hybrid_command(name="pjskupdatescores", description="下載/分析全歌曲 SUS，建立技能覆蓋率與理論分數快取")
+@app_commands.describe(
+    difficulty="只更新特定難度，預設全部",
+    force_download="重新下載已快取的 SUS",
+    limit="測試用，只處理前 N 張譜，正式更新請留空",
+)
+@app_commands.choices(difficulty=DIFFICULTY_CHOICES)
+async def pjsk_update_scores_command(
+    ctx: commands.Context,
+    difficulty: str = "all",
+    force_download: bool = False,
+    limit: Optional[int] = None,
+) -> None:
+    if not await safe_ctx_defer(ctx):
+        return
+
+    if PJSK_SCORE_UPDATE_LOCK.locked():
+        await safe_ctx_send(ctx, "PJSK 分析更新已經在執行中，請等目前這輪完成。")
+        return
+
+    selected = None if difficulty == "all" else {difficulty}
+    await safe_ctx_send(ctx, "PJSK SUS 分析已開始；完整更新可能需要一段時間，進度請看 Render logs。")
+
+    try:
+        payload = await run_pjsk_score_update(
+            reason=f"discord-command:{ctx.author.id}",
+            force_download=force_download,
+            difficulties=selected,
+            limit=limit,
+            auto_update_menu=True,
+        )
+    except Exception:
+        log.exception("PJSK score update command failed")
+        await safe_ctx_send(ctx, "PJSK SUS 分析失敗；請查看 Render logs 的錯誤內容。")
+        return
+
+    cache_file = pjsk_score_cache_path(DATA_DIR)
+    length_file = pjsk_length_overrides_path(DATA_DIR)
+    mismatch_count = sum(1 for chart in payload.get("charts", []) if not chart.get("combo_match"))
+    missing_length_count = sum(1 for chart in payload.get("charts", []) if chart.get("length_multiplier") is None)
+    complete_text = "完整" if payload.get("complete", True) else "未完整"
+    await safe_ctx_send(
+        ctx,
+        "PJSK 更新完成："
+        f"狀態 `{complete_text}`，成功 `{payload.get('chart_count', 0)}` 張譜，失敗 `{payload.get('error_count', 0)}` 張。"
+        f"\nCombo 不一致 `{mismatch_count}` 張，缺長度倍率 `{missing_length_count}` 張。"
+        f"\n快取：`{cache_file}`"
+        f"\n長度倍率補檔：`{length_file}`",
+    )
+
+
 @bot.hybrid_command(name="pjskrank", description="依綜合力/活動倍率/火數計算活動pt排行")
 @app_commands.describe(
     power="綜合力；依活動pt/理論分數排行時需要",
@@ -1834,6 +1895,7 @@ async def help_command(ctx: commands.Context) -> None:
             "`/trackrank mode rank` 查指定名次資訊，可輸入 `14,15,16,17,18` 或 `14-18`\n"
             "`/playerrank mode` 查自己目前排名\n"
             "`/line mode` 查活動榜線\n"
+            "`/pjskupdatescores` 手動下載/分析 SUS 分數資料\n"
             "`/pjskrank` 查技能覆蓋/理論分數/活動pt排行\n"
             "`/pjskchart song difficulty` 查單曲分數細節，綜合力可留空\n"
             "`/pjskchartall song` 查單曲全難度分數，綜合力可留空"
