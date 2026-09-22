@@ -445,6 +445,9 @@ class SusTheoryAnalyzer:
         skill_multiplier: float = 3.0,
         fever_multiplier: float = 1.5,
         fever_combo_ratio: float = 0.10,
+        combo_bonus_enabled: bool = True,
+        note_score_factor: float = 1.0,
+        skill_boundary_variation: bool = True,
     ) -> dict:
         events = self.scoring_events()
         timed = [(event, self.time_at_bar(event.bar)) for event in events]
@@ -500,8 +503,8 @@ class SusTheoryAnalyzer:
 
         for score_index, (event, sec) in enumerate(timed, start=1):
             combo = combo_at_score_index(score_index)
-            combo_bonus = 1 + min(combo // 100, 10) * 0.01
-            note_share = base_multiplier * event.weight / total_weight if total_weight else 0.0
+            combo_bonus = 1 + min(combo // 100, 10) * 0.01 if combo_bonus_enabled else 1.0
+            note_share = base_multiplier * note_score_factor * event.weight / total_weight if total_weight else 0.0
             skill_indexes = []
             skill_indexes_min = []
             skill_indexes_max = []
@@ -509,10 +512,10 @@ class SusTheoryAnalyzer:
                 if start <= sec < end:
                     skill_indexes.append(i)
                     skill_weight_by_window[i] += event.weight
-                if start < sec < end:
+                if skill_boundary_variation and start < sec < end:
                     skill_indexes_min.append(i)
                     skill_weight_by_window_min[i] += event.weight
-                if start <= sec <= end:
+                if skill_boundary_variation and start <= sec <= end:
                     skill_indexes_max.append(i)
                     skill_weight_by_window_max[i] += event.weight
             in_fever = (
@@ -540,6 +543,14 @@ class SusTheoryAnalyzer:
                 skill_score_terms_max[skill_indexes_max[0]] += base_score
             score_multiplier_min += base_score * (skill_multiplier if skill_indexes_min else 1.0)
             score_multiplier_max += base_score * (skill_multiplier if skill_indexes_max else 1.0)
+
+        if not skill_boundary_variation:
+            skill_weight_by_window_min = list(skill_weight_by_window)
+            skill_weight_by_window_max = list(skill_weight_by_window)
+            skill_score_terms_min = list(skill_score_terms)
+            skill_score_terms_max = list(skill_score_terms)
+            score_multiplier_min = score_multiplier
+            score_multiplier_max = score_multiplier
 
         kind_counter = Counter(event.kind for event in events)
         skill_coverages = [
