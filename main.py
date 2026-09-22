@@ -88,6 +88,7 @@ PJSK_SKILL_MODE_CHOICES = [
 PJSK_SCORE_MODE_CHOICES = [
     app_commands.Choice(name="多人/協力：加活躍分", value="multi"),
     app_commands.Choice(name="單人/挑戰：不加活躍分", value="solo"),
+    app_commands.Choice(name="自動：0.7 分且無 combo 加成", value="auto"),
 ]
 
 CHARACTER_MAP = {
@@ -1284,6 +1285,27 @@ def active_bonus_power_multiplier_for_mode(mode: str) -> float:
     return 0.375 if mode == "multi" else 0.0
 
 
+def use_fever_for_score_mode(mode: str) -> bool:
+    return mode == "multi"
+
+
+def score_variant_for_mode(mode: str) -> str | None:
+    return "auto" if mode == "auto" else None
+
+
+def chart_supports_score_mode(chart: dict[str, Any], score_mode: str) -> bool:
+    if score_mode == "auto":
+        return chart.get("score_base_power_multiplier_auto") is not None
+    return True
+
+
+def analysis_supports_score_mode(analysis: dict[str, Any], score_mode: str) -> bool:
+    charts = analysis.get("charts", [])
+    if not charts:
+        return True
+    return chart_supports_score_mode(charts[0], score_mode)
+
+
 def format_number_range(low: float, high: float, *, digits: int = 0, suffix: str = "") -> str:
     if abs(low - high) < 10 ** (-(digits + 1)):
         return f"{low:.{digits}f}{suffix}"
@@ -1297,10 +1319,11 @@ def format_skill_coverages(
     team_power: int | None = None,
     total_score: float | None = None,
     use_fever: bool = True,
+    score_variant: str | None = None,
 ) -> str:
     multipliers = skill_multipliers or [3.7] * 6
     parts = []
-    suffix = "" if use_fever else "_no_fever"
+    suffix = "_auto" if score_variant == "auto" else ("" if use_fever else "_no_fever")
     skill_terms = chart.get(f"skill_score_terms{suffix}") or chart.get("skill_score_terms") or []
     skill_terms_min = chart.get(f"skill_score_terms_min{suffix}") or chart.get("skill_score_terms_min") or skill_terms
     skill_terms_max = chart.get(f"skill_score_terms_max{suffix}") or chart.get("skill_score_terms_max") or skill_terms
@@ -1327,8 +1350,8 @@ def format_skill_coverages(
                 segment_pct_min = segment_score_min / total_score * 100 if total_score else 0.0
                 segment_pct_max = segment_score_max / total_score * 100 if total_score else 0.0
 
-        coverage_low = float(row.get("coverage_pct_min", row["coverage_pct"]))
-        coverage_high = float(row.get("coverage_pct_max", row["coverage_pct"]))
+        coverage_low = float(row["coverage_pct"] if score_variant == "auto" else row.get("coverage_pct_min", row["coverage_pct"]))
+        coverage_high = float(row["coverage_pct"] if score_variant == "auto" else row.get("coverage_pct_max", row["coverage_pct"]))
         coverage_text = format_number_range(coverage_low, coverage_high, digits=2, suffix="%")
 
         if team_power is not None and segment_score_min is not None:
@@ -1390,6 +1413,7 @@ def lightweight_rank_rows(
     skill_multipliers: list[float],
     active_bonus: float,
     use_fever: bool,
+    score_variant: str | None,
     difficulty: str,
     sort_by: str,
 ) -> list[dict[str, Any]]:
@@ -1417,6 +1441,7 @@ def lightweight_rank_rows(
                 skill_multipliers,
                 active_bonus,
                 use_fever,
+                score_variant,
             )
             row.update(
                 {
@@ -1502,7 +1527,7 @@ async def pjsk_update_scores_command(
     power="綜合力；依活動pt/理論分數排行時需要",
     event_multiplier="活動倍率，依活動pt排行時使用，預設 1",
     bonus="bonus 消耗，預設 5 火",
-    score_mode="分數模式，多人套 fever 與活躍分，單人不套",
+    score_mode="分數模式：多人、單人/挑戰，或自動",
     skill_mode="技能倍率輸入方式",
     skill_multiplier="單一技能倍率，預設 3.7",
     skill1="第 1 段技能倍率，skill_mode=6段分別輸入時使用",
@@ -1552,6 +1577,9 @@ async def pjsk_rank_command(
     if sort_by in {"event_pt", "score"} and power is None:
         await safe_ctx_send(ctx, "依活動pt或理論分數排行需要填 `power`；若只想看覆蓋率，排序請選 `技能覆蓋率`。")
         return
+    if not analysis_supports_score_mode(analysis, score_mode):
+        await safe_ctx_send(ctx, "目前的 PJSK 分析快取還沒有自動模式分數欄位，請先重新跑 `/pjskupdatescores`。")
+        return
     start_rank = max(1, start_rank)
     end_rank = max(start_rank, end_rank)
     end_rank = min(end_rank, start_rank + 49)
@@ -1559,7 +1587,8 @@ async def pjsk_rank_command(
         skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
     )
     active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
-    use_fever = score_mode == "multi"
+    use_fever = use_fever_for_score_mode(score_mode)
+    score_variant = score_variant_for_mode(score_mode)
     rows = lightweight_rank_rows(
         analysis,
         power=power,
@@ -1568,6 +1597,7 @@ async def pjsk_rank_command(
         skill_multipliers=skill_multipliers,
         active_bonus=active_bonus,
         use_fever=use_fever,
+        score_variant=score_variant,
         difficulty=difficulty,
         sort_by=sort_by,
     )
@@ -1576,7 +1606,7 @@ async def pjsk_rank_command(
         return
     page = rows[start_rank - 1 : end_rank]
     skill_label = "技能 " + "/".join(f"{value:g}" for value in skill_multipliers)
-    mode_label = "多人" if score_mode == "multi" else "單人/挑戰"
+    mode_label = {"multi": "多人", "solo": "單人/挑戰", "auto": "自動"}.get(score_mode, score_mode)
     power_label = f"{power:,}" if power is not None else "未填綜合力"
     title = f"PJSK 排行 {start_rank}-{start_rank + len(page) - 1}｜{mode_label}｜{power_label}｜活動倍率 {event_multiplier:g}｜{bonus}火｜{skill_label}"
     await send_query_embed(
@@ -1593,7 +1623,7 @@ async def pjsk_rank_command(
     power="綜合力；不填則只顯示覆蓋率與分數倍率",
     event_multiplier="活動倍率，預設 1",
     bonus="bonus 消耗，預設 5 火",
-    score_mode="分數模式，多人套 fever 與活躍分，單人不套",
+    score_mode="分數模式：多人、單人/挑戰，或自動",
     skill_mode="技能倍率輸入方式",
     skill_multiplier="單一技能倍率，預設 3.7",
     skill1="第 1 段技能倍率，skill_mode=6段分別輸入時使用",
@@ -1637,15 +1667,28 @@ async def pjsk_chart_command(
     if not chart:
         await safe_ctx_send(ctx, "找不到這首歌/難度；可以用歌曲 ID 或更完整的曲名試一次。")
         return
+    if not chart_supports_score_mode(chart, score_mode):
+        await safe_ctx_send(ctx, "目前的 PJSK 分析快取還沒有自動模式分數欄位，請先重新跑 `/pjskupdatescores`。")
+        return
     skill_multipliers = resolve_skill_multipliers(
         skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
     )
     active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
-    use_fever = score_mode == "multi"
+    use_fever = use_fever_for_score_mode(score_mode)
+    score_variant = score_variant_for_mode(score_mode)
     
     # 不管有沒有填綜合力，都先假定至少為 1 算一次，藉此拿精準的倍率
     dummy_power = power if power is not None else 1
-    calc = calculate_event_points(chart, dummy_power, event_multiplier, bonus, skill_multipliers, active_bonus, use_fever)
+    calc = calculate_event_points(
+        chart,
+        dummy_power,
+        event_multiplier,
+        bonus,
+        skill_multipliers,
+        active_bonus,
+        use_fever,
+        score_variant,
+    )
     
     fever = chart.get("fever", {})
     length_multiplier = calc["length_multiplier"]
@@ -1685,7 +1728,7 @@ async def pjsk_chart_command(
     )
     skill_total = sum(float(row["covered_weight"]) for row in chart.get("skill_coverages", []))
     skill_total_pct = skill_total / chart["total_weight"] * 100 if chart["total_weight"] else 0.0
-    mode_text = "多人/協力" if score_mode == "multi" else "單人/挑戰"
+    mode_text = {"multi": "多人/協力", "solo": "單人/挑戰", "auto": "自動"}.get(score_mode, score_mode)
     embed.add_field(name="分數模式", value=mode_text, inline=False)
     embed.add_field(name="總技能覆蓋率", value=f"{skill_total_pct:.2f}%", inline=False)
     embed.add_field(name="技能倍率", value="/".join(f"x{value:g}" for value in skill_multipliers), inline=False)
@@ -1697,6 +1740,7 @@ async def pjsk_chart_command(
             team_power=power,
             total_score=calc["score"] if power is not None else None,
             use_fever=use_fever,
+            score_variant=score_variant,
         ),
         inline=False,
     )
@@ -1752,7 +1796,7 @@ def find_pjsk_score_charts_for_song(analysis: dict[str, Any], query: str) -> lis
     power="綜合力；不填則只顯示分數倍率",
     event_multiplier="活動倍率，預設 1",
     bonus="bonus 消耗，預設 5 火",
-    score_mode="分數模式，多人套 fever 與活躍分，單人不套",
+    score_mode="分數模式：多人、單人/挑戰，或自動",
     skill_mode="技能倍率輸入方式",
     skill_multiplier="單一技能倍率，預設 3.7",
     skill1="第 1 段技能倍率，skill_mode=6段分別輸入時使用",
@@ -1795,12 +1839,16 @@ async def pjsk_chart_all_command(
     if not charts:
         await safe_ctx_send(ctx, "找不到這首歌；可以用歌曲 ID 或更完整的曲名試一次。")
         return
+    if not chart_supports_score_mode(charts[0], score_mode):
+        await safe_ctx_send(ctx, "目前的 PJSK 分析快取還沒有自動模式分數欄位，請先重新跑 `/pjskupdatescores`。")
+        return
 
     skill_multipliers = resolve_skill_multipliers(
         skill_mode, skill_multiplier, skill1, skill2, skill3, skill4, skill5, skill6
     )
     active_bonus = active_bonus_power_multiplier_for_mode(score_mode)
-    use_fever = score_mode == "multi"
+    use_fever = use_fever_for_score_mode(score_mode)
+    score_variant = score_variant_for_mode(score_mode)
     dummy_power = power if power is not None else 1
     lines = []
     for chart in charts:
@@ -1812,6 +1860,7 @@ async def pjsk_chart_all_command(
             skill_multipliers,
             active_bonus,
             use_fever,
+            score_variant,
         )
         prefix = f"**{chart['difficulty'].upper()}** Lv.{chart['level']}｜"
         if power is not None:
@@ -1836,7 +1885,7 @@ async def pjsk_chart_all_command(
             )
             lines.append(f"{prefix}理論分數 `{score_multiplier_text} 綜合力`")
 
-    mode_text = "多人/協力" if score_mode == "multi" else "單人/挑戰"
+    mode_text = {"multi": "多人/協力", "solo": "單人/挑戰", "auto": "自動"}.get(score_mode, score_mode)
     power_text = f"{power:,}" if power is not None else "未填"
     embed = discord.Embed(
         title=f"{charts[0]['title']}｜全難度",
@@ -1975,6 +2024,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
