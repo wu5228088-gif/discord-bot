@@ -343,6 +343,14 @@ def analyze_chart(
         official_combo=official_combo,
         fever_multiplier=1.0,
     )
+    result_auto = analyzer.analyze(
+        int(difficulty["playLevel"]),
+        official_combo=official_combo,
+        fever_multiplier=1.0,
+        combo_bonus_enabled=False,
+        note_score_factor=0.7,
+        skill_boundary_variation=False,
+    )
     music_id = int(music["id"])
     length_multiplier, length_source = resolve_length_multiplier(music, difficulty_name, length_lookup)
     combo_match = official_combo == int(result["combo_count_used"])
@@ -371,6 +379,13 @@ def analyze_chart(
         "skill_score_terms_no_fever": [float(value) for value in result_no_fever["skill_score_terms"]],
         "skill_score_terms_min_no_fever": [float(value) for value in result_no_fever["skill_score_terms_min"]],
         "skill_score_terms_max_no_fever": [float(value) for value in result_no_fever["skill_score_terms_max"]],
+        "score_power_multiplier_auto": float(result_auto["score_power_multiplier"]),
+        "score_power_multiplier_min_auto": float(result_auto["score_power_multiplier_min"]),
+        "score_power_multiplier_max_auto": float(result_auto["score_power_multiplier_max"]),
+        "score_base_power_multiplier_auto": float(result_auto["score_base_power_multiplier"]),
+        "skill_score_terms_auto": [float(value) for value in result_auto["skill_score_terms"]],
+        "skill_score_terms_min_auto": [float(value) for value in result_auto["skill_score_terms_min"]],
+        "skill_score_terms_max_auto": [float(value) for value in result_auto["skill_score_terms_max"]],
         "base_power_multiplier": float(result["base_power_multiplier"]),
         "length_multiplier": length_multiplier,
         "length_multiplier_source": length_source,
@@ -385,7 +400,7 @@ def update_master_cache(master_dir: Path) -> bool:
     print("正在從遠端更新 musics.json 與 musicDifficulties.json ...")
     try:
         master_dir.mkdir(parents=True, exist_ok=True)
-        base_url = "https://sekai-world.github.io/sekai-master-db-diff"
+        base_url = os.getenv("PJSK_SCORE_MASTER_BASE_URL", "https://sekai-world.github.io/sekai-master-db-diff").rstrip("/")
 
         musics_response = requests.get(f"{base_url}/musics.json", timeout=15)
         musics_response.raise_for_status()
@@ -508,7 +523,7 @@ def build_analysis(
         difficulty_name = difficulty["musicDifficulty"]
         sus_file = cache_dir / f"{music_id:04d}_{difficulty_name}.sus"
         cached_chart = previous_charts.get((music_id, difficulty_name))
-        if cached_chart is not None:
+        if cached_chart is not None and cached_chart.get("score_base_power_multiplier_auto") is not None:
             reused_chart = dict(cached_chart)
             length_multiplier, length_source = resolve_length_multiplier(music, difficulty_name, length_lookup)
             reused_chart["title"] = music["title"]
@@ -589,14 +604,21 @@ def normalize_skill_multipliers(skill_multipliers: float | list[float] | tuple[f
     return (values + [values[-1]] * 6)[:6]
 
 
+def score_suffix(use_fever: bool = True, score_variant: str | None = None) -> str:
+    if score_variant == "auto":
+        return "_auto"
+    return "" if use_fever else "_no_fever"
+
+
 def score_power_multiplier_for_chart(
     chart: dict[str, Any],
     skill_multipliers: float | list[float] | tuple[float, ...] | None = None,
     *,
     use_fever: bool = True,
+    score_variant: str | None = None,
 ) -> float:
     multipliers = normalize_skill_multipliers(skill_multipliers)
-    suffix = "" if use_fever else "_no_fever"
+    suffix = score_suffix(use_fever, score_variant)
     base = chart.get(f"score_base_power_multiplier{suffix}")
     min_terms = chart.get(f"skill_score_terms_min{suffix}")
     max_terms = chart.get(f"skill_score_terms_max{suffix}")
@@ -622,14 +644,20 @@ def score_power_multiplier_range_for_chart(
     skill_multipliers: float | list[float] | tuple[float, ...] | None = None,
     *,
     use_fever: bool = True,
+    score_variant: str | None = None,
 ) -> tuple[float, float]:
     multipliers = normalize_skill_multipliers(skill_multipliers)
-    suffix = "" if use_fever else "_no_fever"
+    suffix = score_suffix(use_fever, score_variant)
     base = chart.get(f"score_base_power_multiplier{suffix}")
     min_terms = chart.get(f"skill_score_terms_min{suffix}")
     max_terms = chart.get(f"skill_score_terms_max{suffix}")
     if base is None or not min_terms or not max_terms:
-        value = score_power_multiplier_for_chart(chart, multipliers, use_fever=use_fever)
+        value = score_power_multiplier_for_chart(
+            chart,
+            multipliers,
+            use_fever=use_fever,
+            score_variant=score_variant,
+        )
         return value, value
     low = float(base) + sum(float(term) * (multipliers[i] - 1.0) for i, term in enumerate(min_terms[:6]))
     high = float(base) + sum(float(term) * (multipliers[i] - 1.0) for i, term in enumerate(max_terms[:6]))
@@ -644,13 +672,20 @@ def calculate_event_points(
     skill_multipliers: float | list[float] | tuple[float, ...] | None = None,
     active_bonus_power_multiplier: float = 0.0,
     use_fever: bool = True,
+    score_variant: str | None = None,
 ) -> dict[str, Any]:
     bonus_multiplier = BONUS_MULTIPLIERS.get(int(bonus), BONUS_MULTIPLIERS[5])
-    score_power_multiplier = score_power_multiplier_for_chart(chart, skill_multipliers, use_fever=use_fever)
+    score_power_multiplier = score_power_multiplier_for_chart(
+        chart,
+        skill_multipliers,
+        use_fever=use_fever,
+        score_variant=score_variant,
+    )
     score_power_multiplier_min, score_power_multiplier_max = score_power_multiplier_range_for_chart(
         chart,
         skill_multipliers,
         use_fever=use_fever,
+        score_variant=score_variant,
     )
     score_power_multiplier_total = score_power_multiplier + active_bonus_power_multiplier
     score_power_multiplier_min_total = score_power_multiplier_min + active_bonus_power_multiplier
@@ -673,6 +708,7 @@ def calculate_event_points(
         "note_score_power_multiplier": score_power_multiplier,
         "active_bonus_power_multiplier": active_bonus_power_multiplier,
         "use_fever": use_fever,
+        "score_variant": score_variant,
         "base_pt": base_pt,
         "base_pt_min": base_pt_min,
         "base_pt_max": base_pt_max,
@@ -694,6 +730,7 @@ def rank_charts(
     skill_multipliers: float | list[float] | tuple[float, ...] | None = None,
     active_bonus_power_multiplier: float = 0.0,
     use_fever: bool = True,
+    score_variant: str | None = None,
     difficulty: str = "all",
     sort_by: str = "event_pt",
 ) -> list[dict[str, Any]]:
@@ -709,6 +746,7 @@ def rank_charts(
             skill_multipliers,
             active_bonus_power_multiplier,
             use_fever,
+            score_variant,
         )
         skill_total = sum(float(row["covered_weight"]) for row in chart.get("skill_coverages", []))
         rows.append(
@@ -890,6 +928,11 @@ def main() -> None:
     parser.add_argument("--length-xlsx", type=Path, default=default_length_xlsx())
     parser.add_argument("--length-overrides", type=Path)
     parser.add_argument("--force-download", action="store_true")
+    parser.add_argument(
+        "--auto-update-menu",
+        action="store_true",
+        help="Download the latest master music data and length multiplier overrides before analysis.",
+    )
     parser.add_argument("--difficulty", choices=["all", *DIFFICULTY_ORDER], default="all")
     parser.add_argument("--limit", type=int)
     parser.add_argument(
@@ -910,6 +953,7 @@ def main() -> None:
         difficulties=difficulties,
         limit=args.limit,
         assets_hosts=args.assets_hosts,
+        auto_update_menu=args.auto_update_menu,
     )
     print(f"analyzed={payload['chart_count']} errors={payload['error_count']}")
     print(cache_path(args.data_dir))
